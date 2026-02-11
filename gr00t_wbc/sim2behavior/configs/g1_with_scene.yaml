@@ -1,0 +1,63 @@
+# OmniGibson config for Unitree G1 with a scene that has geometry (floor, walls).
+# Use this for a visible background that contrasts with the robot (instead of empty "Scene").
+#
+# How to use: pass this config when running the GR00T client or standalone script, e.g.:
+#   --config_path configs/g1_with_scene.yaml
+#
+# Requirements:
+#   - OmniGibson must have access to BEHAVIOR scene data. Set BEHAVIOR_DATA_PATH (or the
+#     path OmniGibson uses for scene_model assets) so that the chosen scene_model exists.
+#   - scene_model "Rs_int" is a simple room; other options depend on your OmniGibson/BEHAVIOR install.
+#     See: https://behavior.stanford.edu/omnigibson/scenes.html
+#
+# Same camera/robot settings as g1_standalone.yaml; only the scene section differs.
+
+env:
+  action_frequency: 30
+  rendering_frequency: 30
+  physics_frequency: 120
+  external_sensors:
+    - sensor_type: VisionSensor
+      name: topdown_camera
+      relative_prim_path: /topdown_camera
+      modalities: [rgb]
+      sensor_kwargs:
+        image_height: 480
+        image_width: 640
+        focal_length: 12.0
+      # Use z=6.0 so the camera is clearly above the room (Rs_int ceiling ~3m); at z=3.5 the
+      # camera can end up inside geometry or above origin but not above the robot in some scenes.
+      position: [0.0, 0.0, 6.0]
+      orientation: [0.0, 0.0, 0.0, 1.0]  # identity (look -Z). If you see sky, try --topdown_orientation flip_x
+      pose_frame: scene
+      include_in_obs: true
+
+# Scene with geometry: floor, walls, and furniture (better contrast with robot than empty Scene).
+# Do NOT set load_object_categories here; leaving it unset loads all categories from the scene
+# JSON (floors, walls, furniture, etc.). If you set e.g. load_object_categories: ["floors", "walls"],
+# the saved scene USD (OMNIGIBSON_SAVE_SCENE_USD_TO) will only contain structure and look almost empty.
+scene:
+  type: "InteractiveTraversableScene"
+  scene_model: "Rs_int"   # Simple room; must exist in BEHAVIOR/OmniGibson scene data.
+  trav_map_resolution: 0.1
+  # load_object_categories: null   # leave unset = load all categories (default)
+  # Optional (OmniGibson defaults):
+  # default_erosion_radius: 0.0
+  # trav_map_with_objects: true
+  # num_waypoints: 10
+  # waypoint_resolution: 0.2
+
+robots:
+  - type: "UnitreeG1"
+    name: "unitree_g1"
+    position: [0.0, 0.0, 0.8]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+    action_normalize: False
+    self_collisions: True
+    obs_modalities: ["proprio", "rgb"]
+    sensor_config:
+      VisionSensor:
+        sensor_kwargs:
+          image_height: 480   # Match MuJoCo RS_VIEW_CAMERA_HEIGHT
+          image_width: 640    # Match MuJoCo RS_VIEW_CAMERA_WIDTH
+          focal_length: 5.41  # Match MuJoCo robot0_oak_egoview fovy 79.5° (vertical FOV)

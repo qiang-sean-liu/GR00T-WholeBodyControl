@@ -1,0 +1,12 @@
+# OmniGibson and BEHAVIOR stack for sim2behavior (G1 in OmniGibson).
+# Install in a dedicated venv; see sim2behavior_DESIGN.md §11.
+# Install OmniGibson and BEHAVIOR per their official docs first, then:
+#   pip install -r requirements.txt
+
+# Optional: minimal deps for the standalone script if not using full OmniGibson install
+numpy>=1.24.0
+pyyaml>=6.0
+
+# OmniGibson / BEHAVIOR: install separately per official instructions, e.g.:
+# - https://behavior.stanford.edu/omnigibson/
+# - https://behavior.stanford.edu/

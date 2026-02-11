@@ -1,0 +1,36 @@
+# sim2behavior: Unitree G1 + OmniGibson (BEHAVIOR) config.
+#
+# PURPOSE: Single source of truth for the G1 robot in sim2behavior (paths, controller
+# semantics, GR00T interface). Used by:
+#   - run_omnigibson_g1_standalone.py: only robot.urdf_path and robot.meshes_dir
+#     (for path validation and URDF resolution). Controllers are NOT passed to OmniGibson.
+#   - configs/g1_standalone.yaml: OmniGibson runtime config; its controller_config is
+#     what OmniGibson actually uses. Keep that in sync with this file's controllers.
+#   - BEHAVIORGr00tEnv / UnitreeG1Dex3Env: can load this file for GR00T obs/action mapping.
+#
+# For the standalone script, the file that is REALLY responsible for controller
+# behavior at runtime is configs/g1_standalone.yaml (passed to og.Environment).
+
+robot:
+  urdf_path: "urdf/g1_29dof_with_hand.urdf"
+  meshes_dir: "meshes"
+  root_link: "pelvis"
+
+controllers:
+  base:
+    type: "diff_drive"
+  waist:
+    type: "joint"
+    joint_names: ["waist_yaw_joint"]
+  arms:
+    type: "joint"
+  hands:
+    type: "multi_finger"
+    finger_type: "Dex3_1"
+
+gr00t_interface:
+  obs_keys: ["rgb", "joint_state", "task_instruction"]
+  action_execution_steps: 16
+  action_mapping:
+    joint_order: []
+    scale: 1.0

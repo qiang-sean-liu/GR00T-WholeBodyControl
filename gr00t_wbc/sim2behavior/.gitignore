@@ -1,0 +1,5 @@
+# Optional meshes symlink (platform-dependent); create with scripts/setup_meshes_symlink.py
+resources/robots/g1/meshes
+
+# Local OmniGibson / BEHAVIOR config overrides
+configs/local_*.yaml

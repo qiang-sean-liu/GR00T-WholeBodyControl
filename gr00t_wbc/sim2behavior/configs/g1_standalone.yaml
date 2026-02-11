@@ -1,0 +1,64 @@
+# Minimal OmniGibson standalone config for Unitree G1 (sim2behavior).
+# Loads G1 URDF in a simple empty scene for testing robot loading and basic control.
+#
+# Camera parameters match GR00T G1 evaluation (gr00t_wbc/data/constants.py and SyncEnv):
+#   RS_VIEW_CAMERA_WIDTH=640, RS_VIEW_CAMERA_HEIGHT=480. RoboCasa uses fovy=60° for agentview;
+#   focal_length tuned to give a similar FOV (wider than default 17 mm).
+
+env:
+  action_frequency: 30  # Hz
+  rendering_frequency: 30  # Hz
+  physics_frequency: 120  # Hz
+  # Optional: external cameras (scene-level, not on robot). Observations appear in obs["external"][sensor_name].
+  external_sensors:
+    - sensor_type: VisionSensor
+      name: topdown_camera
+      relative_prim_path: /topdown_camera
+      modalities: [rgb]
+      sensor_kwargs:
+        image_height: 480   # Match G1 eval: RS_VIEW_CAMERA_HEIGHT
+        image_width: 640    # Match G1 eval: RS_VIEW_CAMERA_WIDTH
+        # Wider FOV so the robot fits in frame (~60° like RoboCasa agentview).
+        focal_length: 12.0
+      position: [0.0, 0.0, 3.5]   # above robot (robot at z≈0.8); raise to 3.5 if needed to see full body
+      # identity = look along -Z. If view shows sky, use script flag: --topdown_orientation flip_x
+      orientation: [0.0, 0.0, 0.0, 1.0]
+      pose_frame: scene
+      include_in_obs: true
+
+scene:
+  type: "Scene"  # Minimal empty scene (no floor/walls).
+  # For a scene with geometry (floor, walls) and better contrast with the robot, use the
+  # alternative config: --config_path configs/g1_with_scene.yaml (see g1_with_scene.yaml).
+#
+# Background (robot vs scene color): With type "Scene" there is no floor or sky mesh; the visible
+# background is Isaac Sim's default clear color/sky from the active viewport or render product.
+# OmniGibson does not expose a background color in this config. To get a different background:
+#  - In Isaac Sim: change the viewport/render product clear color (e.g. via RenderingSettings or
+#    the camera/render API). See Isaac Sim docs: "Environment setup", "Rendering", "Scene setup".
+#  - In OmniGibson: use a scene with geometry (e.g. InteractiveTraversableScene + scene_model)
+#    so the background is floor/walls instead of the default clear color.
+#  - The Unitree G1 robot mesh colors come from its USD/URDF materials in omnigibson-robot-assets.
+
+robots:
+  - type: "UnitreeG1"  # OmniGibson built-in G1 (uses omnigibson-robot-assets; must match REGISTERED_ROBOTS)
+    name: "unitree_g1"
+    # UnitreeG1 loads its own URDF from omnigibson-robot-assets/models/unitree_g1/; no urdf_path override here.
+    position: [0.0, 0.0, 0.8]  # Spawn height (adjust based on pelvis height)
+    orientation: [0.0, 0.0, 0.0, 1.0]  # Quaternion [x, y, z, w]
+    action_normalize: False
+    self_collisions: True
+    obs_modalities: ["proprio", "rgb"]
+    # Omit controller_config so UnitreeG1 uses its defaults: base=JointController (legs),
+    # camera=JointController, arm_*=InverseKinematicsController, gripper_*=MultiFingerGripperController.
+    # Do not set base to DifferentialDriveController (G1 is humanoid, not diff-drive).
+    sensor_config:
+      VisionSensor:
+        sensor_kwargs:
+          image_height: 480   # Match MuJoCo RS_VIEW_CAMERA_HEIGHT
+          image_width: 640    # Match MuJoCo RS_VIEW_CAMERA_WIDTH
+          focal_length: 5.41  # Match MuJoCo robot0_oak_egoview fovy 79.5° (vertical FOV)
+
+# Optional: minimal task config (not needed for standalone robot testing)
+# task:
+#   type: "DummyTask"  # or omit task entirely for pure robot testing
