@@ -32,10 +32,21 @@ With topdown camera following the robot:
         --save_video \
         --topdown_follow_robot \
         --topdown_follow_height 2.7
+
+With Whole-Body Control (WBC) for lower-body locomotion, same as RoboCasa locomanip:
+    python scripts/run_omnigibson_g1_with_gr00t.py \
+        --policy_client_host 127.0.0.1 \
+        --policy_client_port 5555 \
+        --use_wbc
+
+Dump per-step actions (raw GR00T, WBC goal, WBC output) for debugging:
+    python scripts/run_omnigibson_g1_with_gr00t.py ... --dump_actions [--dump_actions_dir /path]
 """
 from __future__ import annotations
 
 import argparse
+import copy
+import json
 import os
 import sys
 import warnings
@@ -277,7 +288,7 @@ def main() -> int:
     parser.add_argument(
         "--video_fps",
         type=int,
-        default=1,
+        default=30,
         help="Frames per second for saved video (default: 1)",
     )
     parser.add_argument(
@@ -325,6 +336,22 @@ def main() -> int:
         default="identity",
         choices=["identity", "flip_x", "flip_y", "flip_z"],
         help="Topdown camera orientation (identity=look down in Isaac; try flip_x/flip_y/flip_z if view is wrong).",
+    )
+    parser.add_argument(
+        "--use_wbc",
+        action="store_true",
+        help="Use Whole-Body Control (WBC) to compute lower-body targets from GR00T navigate/base_height + upper-body; same pipeline as RoboCasa locomanip.",
+    )
+    parser.add_argument(
+        "--dump_actions",
+        action="store_true",
+        help="Dump per-step actions to disk: raw GR00T output, WBC goal (navigate_cmd, base_height, target_upper_body_pose), and WBC output (q).",
+    )
+    parser.add_argument(
+        "--dump_actions_dir",
+        type=str,
+        default="",
+        help="Directory for action dumps (default: <frames_dir>/action_dumps or output_frames/action_dumps).",
     )
     args = parser.parse_args()
 
@@ -535,6 +562,169 @@ def main() -> int:
     action_adapter.og_action_dim = og_action_dim
     action_adapter.og_joint_names = og_joint_names
 
+    def _to_robot_action_dim(robot, action: np.ndarray) -> np.ndarray:
+        """Ensure action length matches robot.action_dim (trim or zero-pad)."""
+        action = np.asarray(action, dtype=np.float32).ravel()
+        adim = getattr(robot, "action_dim", None)
+        if adim is None:
+            return action
+        if len(action) > adim:
+            return action[:adim].copy()
+        if len(action) < adim:
+            return np.concatenate([action, np.zeros(adim - len(action), dtype=np.float32)])
+        return action
+
+    def _get_controller_order_joint_names(robot):
+        """Get joint names in the order expected by env.step(action) (controller order)."""
+        if not hasattr(robot, "controller_order") or not hasattr(robot, "_controllers"):
+            return None
+        # Joint names in articulation/dof order (index i = dof index). UnitreeG1 uses robot.joints, not joint_names/controllable_joints.
+        og_names = getattr(robot, "joint_names", None)
+        if og_names is None and hasattr(robot, "joints") and robot.joints:
+            og_names = list(robot.joints.keys())
+        if og_names is None and hasattr(robot, "controllable_joints"):
+            og_names = [j.name for j in robot.controllable_joints]
+        if og_names is None or len(og_names) == 0:
+            return None
+        names_in_controller_order = []
+        for cname in robot.controller_order:
+            controller = robot._controllers[cname]
+            dof_idx = controller.dof_idx
+            if hasattr(dof_idx, "cpu"):
+                dof_idx = dof_idx.cpu().numpy()
+            dof_idx = np.asarray(dof_idx).ravel()
+            for i in dof_idx:
+                idx = int(i)
+                if 0 <= idx < len(og_names):
+                    names_in_controller_order.append(og_names[idx])
+        return names_in_controller_order if names_in_controller_order else None
+
+    def _pinocchio_name_to_index(robot_model, og_name: str):
+        """Resolve OmniGibson joint name to Pinocchio q index (exact or fuzzy match)."""
+        try:
+            return robot_model.dof_index(og_name)
+        except (ValueError, KeyError):
+            pass
+        # Fuzzy: normalize and find best match in robot_model joint names
+        og_norm = og_name.lower().replace("_", "").replace("-", "").replace(" ", "")
+        for pname in robot_model.joint_names:
+            pnorm = pname.lower().replace("_", "").replace("-", "").replace(" ", "")
+            if og_norm == pnorm or og_norm in pnorm or pnorm in og_norm:
+                try:
+                    return robot_model.dof_index(pname)
+                except (ValueError, KeyError):
+                    continue
+        return None
+
+    def _og_jpos_to_pinocchio_q(robot, jpos, robot_model) -> np.ndarray:
+        """
+        Convert joint positions from OmniGibson articulation order (same as robot.get_joint_positions())
+        to Pinocchio order expected by the GR00T/WBC policy. Ensures observation["q"] is interpreted
+        with the correct joint-to-index mapping (body_indices, lower_body, etc. are Pinocchio indices).
+        """
+        jpos = np.asarray(jpos, dtype=np.float64).ravel()
+        og_names = getattr(robot, "joint_names", None)
+        if og_names is None and hasattr(robot, "joints") and robot.joints:
+            og_names = list(robot.joints.keys())
+        if og_names is None or len(og_names) == 0:
+            return jpos
+        n = getattr(robot_model, "num_joints", None) or getattr(robot_model, "num_dofs", len(jpos))
+        q_pin = np.zeros(int(n), dtype=np.float64)
+        og_name_list = list(og_names)
+        for name in getattr(robot_model, "joint_names", []):
+            try:
+                pidx = robot_model.dof_index(name)
+            except (ValueError, KeyError):
+                continue
+            if pidx < 0 or pidx >= n:
+                continue
+            # Match name to OG (exact then fuzzy)
+            og_idx = None
+            if name in og_name_list:
+                og_idx = og_name_list.index(name)
+            else:
+                norm = name.lower().replace("_", "").replace("-", "").replace(" ", "")
+                for i, og in enumerate(og_name_list):
+                    if og.lower().replace("_", "").replace("-", "").replace(" ", "") == norm:
+                        og_idx = i
+                        break
+            if og_idx is not None and og_idx < len(jpos):
+                q_pin[pidx] = float(jpos[og_idx])
+        return q_pin.astype(np.float32)
+
+    def _pinocchio_q_to_controller_order_action(robot, q_pinocchio: np.ndarray, robot_model) -> np.ndarray:
+        """
+        Convert joint positions from Pinocchio (WBC/robot_model) order to the flat action
+        vector expected by OmniGibson env.step() (controller order), by matching joint names.
+        Use this when q is in Pinocchio order (e.g. WBC output) so pose is correct.
+        Output length is trimmed/padded to robot.action_dim (e.g. 29 for g1_29dof_with_hand).
+        """
+        q = np.asarray(q_pinocchio, dtype=np.float64).ravel()
+        names_in_order = _get_controller_order_joint_names(robot)
+        if names_in_order is None:
+            # Fallback: assume q is already in robot dof order and reorder by controller
+            return _to_robot_action_dim(robot, _joint_positions_to_controller_order_action(robot, q))
+        out = []
+        for og_name in names_in_order:
+            pidx = _pinocchio_name_to_index(robot_model, og_name)
+            if pidx is not None and 0 <= pidx < len(q):
+                out.append(q[pidx])
+            else:
+                out.append(0.0)
+        return _to_robot_action_dim(robot, np.array(out, dtype=np.float32))
+
+    def _joint_positions_to_controller_order_action(robot, q_mapped: np.ndarray) -> np.ndarray:
+        """
+        Convert joint positions (in robot dof order) to controller-order flat action.
+        Only use when q_mapped is already in the same order as robot's internal dof (e.g. from
+        adapter output that was built by name mapping). For WBC output (Pinocchio order), use
+        _pinocchio_q_to_controller_order_action(robot, q, robot_model) instead.
+        """
+        q = np.asarray(q_mapped, dtype=np.float64).ravel()
+        if not hasattr(robot, "controller_order") or not hasattr(robot, "_controllers"):
+            return q
+        parts = []
+        for name in robot.controller_order:
+            controller = robot._controllers[name]
+            dof_idx = controller.dof_idx
+            if hasattr(dof_idx, "cpu"):
+                dof_idx = dof_idx.cpu().numpy()
+            dof_idx = np.asarray(dof_idx).ravel()
+            if len(dof_idx) == 0:
+                continue
+            if np.max(dof_idx) >= len(q) or np.min(dof_idx) < 0:
+                return q  # fallback: return as-is if indices invalid
+            parts.append(q[dof_idx])
+        if not parts:
+            return q
+        return np.concatenate(parts).astype(np.float32)
+
+    # WBC (Whole-Body Control) for sim2behavior: same as RoboCasa locomanip pipeline
+    wbc_policy = None
+    concat_action = None
+    if args.use_wbc:
+        try:
+            from gr00t_wbc.control.main.teleop.configs.configs import BaseConfig
+            from gr00t_wbc.control.policy.wbc_policy_factory import get_wbc_policy
+            from gr00t_wbc.control.utils.n1_utils import concat_action as _concat_action
+            concat_action = _concat_action
+            config = BaseConfig(wbc_version="gear_wbc", enable_waist=True)
+            wbc_config = config.load_wbc_yaml()
+            wbc_config["upper_body_policy_type"] = "identity"
+            robot_type = "g1"
+            wbc_policy = get_wbc_policy(robot_type, robot_model, wbc_config)
+            wbc_policy.activate_policy()
+            print("WBC enabled: lower-body (legs + waist) from G1GearWbcPolicy, upper-body from GR00T.")
+        except Exception as e:
+            err_msg = str(e)
+            print(f"Failed to setup WBC: {e}", file=sys.stderr)
+            if "onnxruntime" in err_msg or (isinstance(e, ModuleNotFoundError) and getattr(e, "name", "") == "onnxruntime"):
+                print("\nWBC requires onnxruntime. Install it with:", file=sys.stderr)
+                print("  pip install onnxruntime", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            return 1
+
     # Setup video saving (optional)
     import numpy as np
     frames_dir = None
@@ -569,8 +759,74 @@ def main() -> int:
             elif isinstance(v, np.ndarray) and v.ndim >= 2 and v.shape[-1] in (3, 4):
                 yield (k or "camera", np.asarray(v)[:, :, :3].astype(np.uint8))
 
+    # External camera (topdown_camera) when following robot: fixed height 1m, offset 1m in x and y from robot, looking at robot.
+    EXTERNAL_CAMERA_HEIGHT = 1.0
+    EXTERNAL_CAMERA_OFFSET_XY = (1.0, 1.0)  # (dx, dy) from robot center
+
+    def _quat_mult_xyzw(q1, q2):
+        """Multiply two quaternions in (x, y, z, w) order: q1 * q2 (apply q2 then q1 in world frame)."""
+        x1, y1, z1, w1 = q1[0], q1[1], q1[2], q1[3]
+        x2, y2, z2, w2 = q2[0], q2[1], q2[2], q2[3]
+        return np.array([
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        ], dtype=np.float32)
+
+    def _look_at_quaternion(camera_pos, target_pos, up=(0.0, 0.0, 1.0)):
+        """Return quaternion (x,y,z,w) so that camera at camera_pos looks at target_pos.
+        VisionSensor in this stack uses +Z as view direction; so camera +Z = forward (toward target), +Y = up.
+        """
+        cam = np.asarray(camera_pos, dtype=np.float64).ravel()[:3]
+        tgt = np.asarray(target_pos, dtype=np.float64).ravel()[:3]
+        up = np.asarray(up, dtype=np.float64).ravel()[:3]
+        forward = tgt - cam
+        n = np.linalg.norm(forward)
+        if n < 1e-9:
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        forward /= n
+        # VisionSensor view = +Z. So camera +Z must point at robot -> third column = +forward. Up = world Z-ish.
+        right = np.cross(up, forward)
+        rn = np.linalg.norm(right)
+        if rn < 1e-9:
+            right = np.array([1.0, 0.0, 0.0])
+        else:
+            right /= rn
+        up_cam = np.cross(forward, right)
+        # R: columns = camera X, Y, Z in world. View = +Z so column 3 = +forward.
+        R = np.column_stack([right, up_cam, forward])
+        # Rotation matrix to quaternion (x, y, z, w)
+        trace = R[0, 0] + R[1, 1] + R[2, 2]
+        if trace > 0:
+            s = 0.5 / np.sqrt(trace + 1.0)
+            w = 0.25 / s
+            x = (R[2, 1] - R[1, 2]) * s
+            y = (R[0, 2] - R[2, 0]) * s
+            z = (R[1, 0] - R[0, 1]) * s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+            w = (R[2, 1] - R[1, 2]) / s
+            x = 0.25 * s
+            y = (R[0, 1] + R[1, 0]) / s
+            z = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+            w = (R[0, 2] - R[2, 0]) / s
+            x = (R[0, 1] + R[1, 0]) / s
+            y = 0.25 * s
+            z = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+            w = (R[1, 0] - R[0, 1]) / s
+            x = (R[0, 2] + R[2, 0]) / s
+            y = (R[1, 2] + R[2, 1]) / s
+            z = 0.25 * s
+        q = np.array([x, y, z, w], dtype=np.float32)
+        return q / np.linalg.norm(q)
+
     def _update_topdown_follow_robot(step_for_log=0):
-        """Update topdown camera to be above the robot (when --topdown_follow_robot is set)."""
+        """Update external camera: height 1m, offset 1m in x and y from robot, oriented at robot center (when --topdown_follow_robot)."""
         if not args.topdown_follow_robot:
             return
         external = env.external_sensors if env else None
@@ -580,29 +836,32 @@ def main() -> int:
             return
         robot = env.robots[0]
         robot_pos, robot_orn = robot.get_position_orientation(frame="world")
-        # Convert to numpy if torch
         if hasattr(robot_pos, "cpu"):
             robot_pos = robot_pos.cpu().numpy()
         else:
             robot_pos = np.asarray(robot_pos)
-        camera_pos = robot_pos + np.array([0.0, 0.0, args.topdown_follow_height], dtype=np.float32)
-        # Quaternion (x,y,z,w). identity = look along -Z (down per Isaac). Try --topdown_orientation if view wrong.
-        _orn_map = {
-            "identity": (0.0, 0.0, 0.0, 1.0),
-            "flip_x": (1.0, 0.0, 0.0, 0.0),   # 180° around X
-            "flip_y": (0.0, 1.0, 0.0, 0.0),   # 180° around Y
-            "flip_z": (0.0, 0.0, 1.0, 0.0),   # 180° around Z
-        }
-        camera_orn = np.array(_orn_map[args.topdown_orientation], dtype=np.float32)
+        # Camera at height 1m, 1m offset in x and y from robot center
+        camera_pos = np.array([
+            float(robot_pos[0]) + EXTERNAL_CAMERA_OFFSET_XY[0],
+            float(robot_pos[1]) + EXTERNAL_CAMERA_OFFSET_XY[1],
+            EXTERNAL_CAMERA_HEIGHT,
+        ], dtype=np.float32)
+        # Orient camera so view axis (+Z) points at robot; single look-at.
+        camera_orn = _look_at_quaternion(camera_pos, robot_pos)
+        # Camera was opposite: rotate 180° around world Z.
+        camera_orn = _quat_mult_xyzw(
+            np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32),  # 180° around Z
+            camera_orn,
+        )
         external["topdown_camera"].set_position_orientation(
             position=camera_pos, orientation=camera_orn, frame="world"
         )
         if args.verbose and step_for_log == 0:
-            print(f"[step 0] robot_pos(world)={robot_pos.tolist()}, topdown_camera_pos={camera_pos.tolist()}, orientation={args.topdown_orientation}")
+            print(f"[step 0] robot_pos(world)={robot_pos.tolist()}, external_camera_pos={camera_pos.tolist()}, look_at_robot")
 
     # Main loop
     if args.topdown_follow_robot:
-        print(f"Topdown camera will follow robot (height offset: {args.topdown_follow_height}m, orientation: {args.topdown_orientation})")
+        print("Topdown camera will follow robot (height 1m, offset 1m in x/y, oriented at robot center)")
     print(f"Starting simulation loop (max {args.max_steps} steps)...")
     reset_out = env.reset()
     og_obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
@@ -618,6 +877,19 @@ def main() -> int:
         frames_dir = frames_dir or os.path.join(SIM2BEHAVIOR_ROOT, "output_frames")
         os.makedirs(frames_dir, exist_ok=True)
         print("Per-frame camera extrinsics dumping enabled (D435 and topdown cameras)")
+
+    # Action dump: single text file (JSON Lines) with raw GR00T, WBC goal, WBC output per step
+    dump_actions_file = None
+    dump_actions_path = None
+    if args.dump_actions:
+        dump_actions_dir = args.dump_actions_dir or os.path.join(
+            frames_dir or os.path.join(SIM2BEHAVIOR_ROOT, "output_frames"),
+            "action_dumps",
+        )
+        os.makedirs(dump_actions_dir, exist_ok=True)
+        dump_actions_path = os.path.join(dump_actions_dir, "actions_dump.jsonl")
+        dump_actions_file = open(dump_actions_path, "w", buffering=1)
+        print(f"Action dumps enabled: writing to {dump_actions_path}")
 
     for step in range(args.max_steps):
         if step % 100 == 0:
@@ -635,10 +907,52 @@ def main() -> int:
                     "cameras": frame_extrinsics
                 })
 
+        # OmniGibson returns proprio as a concatenated vector, not a dict with joint_qpos/joint_velocities.
+        # Enrich obs with joint positions, joint velocities, and (for WBC) base pose/velocity.
+        if robot_name_in_config in og_obs and env.robots:
+            robot = env.robots[0]
+            jpos = robot.get_joint_positions()
+            if hasattr(jpos, "cpu"):
+                jpos = jpos.detach().cpu().numpy()
+            else:
+                jpos = np.asarray(jpos)
+            # Convert to Pinocchio order so policy/WBC see correct joint-to-index mapping (body_indices, etc.)
+            if robot_model is not None:
+                jpos = _og_jpos_to_pinocchio_q(robot, jpos, robot_model)
+            if isinstance(og_obs[robot_name_in_config], dict):
+                og_obs[robot_name_in_config]["joint_qpos"] = jpos
+                # Joint velocities: same OG->Pinocchio mapping so adapter/WBC get observation["dq"] and dq_body_scaled != 0
+                try:
+                    jvel = robot.get_joint_velocities()
+                    if hasattr(jvel, "cpu"):
+                        jvel = jvel.detach().cpu().numpy()
+                    else:
+                        jvel = np.asarray(jvel)
+                    if robot_model is not None:
+                        jvel = _og_jpos_to_pinocchio_q(robot, jvel, robot_model)
+                    og_obs[robot_name_in_config]["joint_velocities"] = jvel.astype(np.float32)
+                except Exception:
+                    pass
+                # Base pose/vel for WBC and policy (adapter uses robot_pos, robot_quat, etc.)
+                try:
+                    pos, ori = robot.get_position_orientation(frame="world")
+                    pos = pos.detach().cpu().numpy() if hasattr(pos, "cpu") else np.asarray(pos)
+                    ori = ori.detach().cpu().numpy() if hasattr(ori, "cpu") else np.asarray(ori)
+                    og_obs[robot_name_in_config]["robot_pos"] = pos[:3]
+                    og_obs[robot_name_in_config]["robot_quat"] = ori[:4]  # x,y,z,w
+                    lin = robot.get_linear_velocity(frame="world")
+                    ang = robot.get_angular_velocity(frame="world")
+                    lin = lin.detach().cpu().numpy() if hasattr(lin, "cpu") else np.asarray(lin)
+                    ang = ang.detach().cpu().numpy() if hasattr(ang, "cpu") else np.asarray(ang)
+                    og_obs[robot_name_in_config]["robot_lin_vel"] = lin[:3]
+                    og_obs[robot_name_in_config]["robot_ang_vel"] = ang[:3]
+                except Exception:
+                    pass
+
         # Adapt OmniGibson observation to GR00T format
         gr00t_obs = obs_adapter.adapt(og_obs, verbose=(args.verbose and step == 0))
-        if current_q is None:
-            current_q = gr00t_obs["q"].copy()
+        # Use current observation's q for action adapter (always from latest state)
+        current_q = gr00t_obs["q"].copy()
         if args.verbose and step == 0:
             print(f"GR00T obs keys: {list(gr00t_obs.keys())}")
             print(f"Camera images: {[k for k in gr00t_obs.keys() if 'image' in k or 'video' in k]}")
@@ -650,6 +964,50 @@ def main() -> int:
             print(f"Error getting action from policy at step {step}: {e}", file=sys.stderr)
             break
 
+        # Snapshot raw GR00T output for action dump (before WBC may overwrite gr00t_action)
+        gr00t_action_for_dump = None
+        wbc_goal_for_dump = None
+        wbc_action_for_dump = None
+        if dump_actions_file is not None:
+            gr00t_action_for_dump = copy.deepcopy(gr00t_action)
+            for k in list(gr00t_action_for_dump.keys()):
+                v = gr00t_action_for_dump[k]
+                if hasattr(v, "cpu"):
+                    gr00t_action_for_dump[k] = np.asarray(v.cpu().numpy())
+                else:
+                    gr00t_action_for_dump[k] = np.asarray(v)
+
+        # Apply WBC (same as RoboCasa locomanip): GR00T -> concat_action -> WBC policy -> full q
+        if wbc_policy is not None and concat_action is not None:
+            try:
+                wbc_goal = concat_action(robot_model, gr00t_action)
+                # Take current timestep only: policy returns (B, T, D), WBC expects 1D per step
+                for k in list(wbc_goal.keys()):
+                    v = wbc_goal[k]
+                    if hasattr(v, "shape") and hasattr(v, "reshape"):
+                        v = np.asarray(v)
+                        if v.ndim == 3:
+                            v = v[0, 0, :]   # (B, T, D) -> (D,)
+                        elif v.ndim == 2:
+                            v = v[0, :]      # (T, D) or (B, D) -> (D,)
+                        if v.ndim > 1:
+                            v = v.reshape(-1)
+                        wbc_goal[k] = np.asarray(v, dtype=np.float64)
+                if dump_actions_file is not None:
+                    wbc_goal_for_dump = {k: np.asarray(v).reshape(-1) for k, v in wbc_goal.items()}
+                wbc_policy.set_observation(gr00t_obs)
+                wbc_policy.set_goal(wbc_goal)
+                wbc_action = wbc_policy.get_action()
+                if dump_actions_file is not None:
+                    wbc_action_for_dump = {"q": np.asarray(wbc_action["q"]).reshape(-1)}
+                # Full q from WBC (43-DOF); map to OmniGibson and step
+                gr00t_action = {"q": np.asarray(wbc_action["q"]).astype(np.float32)}
+            except Exception as e:
+                print(f"WBC step error at step {step}: {e}", file=sys.stderr)
+                if args.verbose:
+                    import traceback
+                    traceback.print_exc()
+
         # Adapt GR00T action to OmniGibson format
         if args.verbose and step == 0:
             print(f"GR00T action keys: {list(gr00t_action.keys())}")
@@ -659,9 +1017,13 @@ def main() -> int:
                 print(f"Action space keys: {list(env.action_space.spaces.keys()) if hasattr(env.action_space.spaces, 'keys') else 'N/A'}")
         
         try:
-            og_action = action_adapter.adapt_with_current_state(
-                gr00t_action, current_q, action_space=env.action_space
-            )
+            if "q" in gr00t_action and gr00t_action.get("q") is not None and len(gr00t_action["q"]) == robot_model.num_joints:
+                # Full q already (e.g. from WBC); no need for current_q
+                og_action = action_adapter.adapt(gr00t_action, action_space=env.action_space)
+            else:
+                og_action = action_adapter.adapt_with_current_state(
+                    gr00t_action, current_q, action_space=env.action_space
+                )
         except Exception as e:
             if args.verbose:
                 print(f"Error adapting action with current state: {e}", file=sys.stderr)
@@ -675,6 +1037,74 @@ def main() -> int:
                     traceback.print_exc()
                 break
         
+        # Convert to OmniGibson controller order so env.step() applies correct joint targets.
+        # When we have full q from WBC (Pinocchio order), map by joint name to controller order.
+        if (
+            isinstance(og_action, dict)
+            and env.robots
+            and robot_name_in_config in og_action
+            and "q" in gr00t_action
+            and gr00t_action.get("q") is not None
+            and len(gr00t_action["q"]) == robot_model.num_joints
+        ):
+            robot = env.robots[0]
+            q_pinocchio = np.asarray(gr00t_action["q"], dtype=np.float64).ravel()
+            if q_pinocchio.size == getattr(robot, "n_dof", q_pinocchio.size):
+                # WBC output is in Pinocchio order: map by joint name to controller order
+                og_action[robot_name_in_config] = _pinocchio_q_to_controller_order_action(
+                    robot, q_pinocchio, robot_model
+                )
+        elif isinstance(og_action, dict) and env.robots and robot_name_in_config in og_action:
+            robot = env.robots[0]
+            q_vec = np.asarray(og_action[robot_name_in_config], dtype=np.float64).ravel()
+            if q_vec.size == getattr(robot, "n_dof", q_vec.size):
+                # Adapter output in dof order: reorder by controller
+                og_action[robot_name_in_config] = _to_robot_action_dim(
+                    robot, _joint_positions_to_controller_order_action(robot, q_vec)
+                )
+
+        # Write per-step action dump to single text file (JSON Lines: one JSON object per step)
+        if dump_actions_file is not None and gr00t_action_for_dump is not None:
+            step_dict = {"step": step}
+            gr00t_serial = {}
+            _T = 30  # policy action horizon
+            for k, v in gr00t_action_for_dump.items():
+                arr = np.asarray(v).reshape(-1)
+                if k == "action.base_height_command":
+                    # Dump only the first timestep value (t=0); ignore t=1,2,... predictions
+                    arr = arr[:1] if arr.size > 0 else arr
+                elif arr.size > _T and arr.size % _T == 0:
+                    d = arr.size // _T
+                    arr = arr[:d]
+                gr00t_serial[k] = arr.tolist()
+            step_dict["gr00t"] = gr00t_serial
+            if wbc_goal_for_dump is not None:
+                step_dict["wbc_goal"] = {
+                    k: np.asarray(v).reshape(-1).tolist() for k, v in wbc_goal_for_dump.items()
+                }
+            if wbc_action_for_dump is not None:
+                step_dict["wbc"] = {
+                    k: np.asarray(v).reshape(-1).tolist() for k, v in wbc_action_for_dump.items()
+                }
+                # Explicit lower/upper body slices so lower-body WBC output is obvious (G1: 15 + 28)
+                q_full = np.asarray(wbc_action_for_dump["q"]).reshape(-1)
+                if len(q_full) >= 43:
+                    step_dict["wbc"]["q_lower_body"] = q_full[:15].tolist()
+                    step_dict["wbc"]["q_upper_body"] = q_full[15:43].tolist()
+                # Dump 86-D ONNX single-step input with labeled keys (cmd_scaled, height_cmd, etc.)
+                if wbc_policy is not None and hasattr(wbc_policy, "lower_body_policy"):
+                    lb = getattr(wbc_policy, "lower_body_policy", None)
+                    if lb is not None and hasattr(lb, "get_last_single_obs_dict"):
+                        onnx_86 = lb.get_last_single_obs_dict()
+                        if onnx_86 is not None:
+                            step_dict["onnx_input_86"] = onnx_86
+            try:
+                dump_actions_file.write(json.dumps(step_dict) + "\n")
+                dump_actions_file.flush()
+            except Exception as e:
+                if args.verbose:
+                    print(f"Action dump write failed for step {step}: {e}", file=sys.stderr)
+
         # The adapter should return the correct format, but ensure it's valid
         if args.verbose and step == 0:
             if isinstance(og_action, dict):
@@ -692,12 +1122,10 @@ def main() -> int:
         else:
             og_obs, reward, done, info = result
 
-        # Update current_q from new observation
-        if "q" in gr00t_obs:
-            current_q = gr00t_obs["q"].copy()
+        # current_q is updated at the start of the next iteration from the new og_obs
 
         # Save video frames (optional)
-        if args.save_video and step % 5 == 0:
+        if args.save_video:
             for cam_name, rgb in _collect_all_rgb(og_obs):
                 if cam_name not in camera_frames:
                     camera_frames[cam_name] = []
@@ -708,6 +1136,10 @@ def main() -> int:
             reset_out = env.reset()
             og_obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
             policy.reset()
+
+    if dump_actions_file is not None:
+        dump_actions_file.close()
+        print(f"Action dumps written to {dump_actions_path}")
 
     # Save videos
     if args.save_video and camera_frames and imageio:
@@ -724,7 +1156,6 @@ def main() -> int:
     
     # Save per-frame camera extrinsics log
     if args.dump_camera_extrinsics_per_frame and camera_extrinsics_log:
-        import json
         extrinsics_path = os.path.join(frames_dir, "camera_extrinsics_per_frame.json")
         try:
             with open(extrinsics_path, "w") as f:

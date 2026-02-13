@@ -64,7 +64,8 @@ python scripts/run_omnigibson_g1_with_gr00t.py \
     --topdown_follow_robot \
     --topdown_follow_height 0.5 \
     --topdown_orientation identity \
-    --config_path configs/g1_with_scene.yaml
+    --config_path configs/g1_with_scene.yaml \
+    --use_wbc
 ```
 
 ### Local policy (no server)
@@ -75,10 +76,62 @@ python scripts/run_omnigibson_g1_with_gr00t.py \
     --task_description "pick up the apple"
 ```
 
+### With WBC (--use_wbc)
+
+To use Whole-Body Control for lower-body locomotion (same pipeline as RoboCasa locomanip), add `--use_wbc`. This requires **onnxruntime** (used by G1GearWbcPolicy):
+
+```bash
+pip install onnxruntime
+```
+
+Then run with `--use_wbc` as in the "Topdown camera following the robot" example above.
+
+### Dumping per-step actions
+
+To dump actions at every step for debugging (raw GR00T policy output, WBC goal, and WBC output):
+
+```bash
+python scripts/run_omnigibson_g1_with_gr00t.py \
+    --policy_client_host 127.0.0.1 \
+    --policy_client_port 5555 \
+    --dump_actions \
+    [--dump_actions_dir /path/to/dir]
+```
+
+- **Output**: a single text file **`actions_dump.jsonl`** in `<frames_dir>/action_dumps/` (or `output_frames/action_dumps/` if no `--frames_dir`). One JSON object per line (JSON Lines format).
+- **Each line** is a JSON object with:
+  - `step`: step index
+  - `gr00t`: raw policy output (e.g. `action.left_arm`, `action.waist`, `navigate_command`) — each value is a list of numbers
+  - `wbc_goal`: input to WBC when `--use_wbc` is set (`navigate_cmd`, `base_height_command`, `target_upper_body_pose`)
+  - `wbc`: WBC output when `--use_wbc` is set:
+    - `q`: full 43-D joint position list (rad). **q[0:15] = lower body** (legs + waist), **q[15:43] = upper body** (arms + hands)
+    - `q_lower_body`: first 15 elements of `q` (lower-body output from ONNX policy)
+    - `q_upper_body`: elements 15–42 of `q` (upper body, same as goal by design)
+
+**Load in Python:**
+
+```python
+import json
+with open("output_frames/action_dumps/actions_dump.jsonl") as f:
+    for line in f:
+        data = json.loads(line)
+        print(data["step"], list(data["gr00t"].keys()))
+        # data["gr00t"]["action.left_arm"]  -> list of 210 floats (30 steps × 7 DOF)
+```
+
+**Analyze WBC smoothness and tracking:**
+
+```bash
+python scripts/analyze_wbc_actions.py [path/to/actions_dump.jsonl] [-o summary.txt]
+```
+
+This reports: (1) smoothness of WBC inputs and outputs; (2) upper-body tracking (goal vs output); (3) lower-body summary (smoothness of `wbc.q[0:15]` and command stats). For how the lower body is controlled and what the ONNX model receives, see [WBC_LOWER_BODY_INPUT_OUTPUT.md](WBC_LOWER_BODY_INPUT_OUTPUT.md). Use the same environment that has `numpy`.
+
 ### Prerequisites
 
 - BEHAVIOR/OmniGibson virtual environment must be activated.
 - Set `OMNIGIBSON_DATA_PATH` to your BEHAVIOR-1K dataset root (e.g. `/mnt/nas26/qiang.liu/BEHAVIOR-1K/datasets`) if using scenes or robot assets.
+- For **--use_wbc**: install `onnxruntime` (`pip install onnxruntime`).
 - See [SCENE_WITH_GEOMETRY.md](SCENE_WITH_GEOMETRY.md) for scene config requirements.
 
 ---

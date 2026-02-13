@@ -49,9 +49,14 @@ robots:
     action_normalize: False
     self_collisions: True
     obs_modalities: ["proprio", "rgb"]
-    # Omit controller_config so UnitreeG1 uses its defaults: base=JointController (legs),
-    # camera=JointController, arm_*=InverseKinematicsController, gripper_*=MultiFingerGripperController.
-    # Do not set base to DifferentialDriveController (G1 is humanoid, not diff-drive).
+    # Base (legs + waist) must use position control so WBC joint position commands are tracked.
+    # Override params under "base" (flat dict); do NOT nest under "JointController" (causes unexpected keyword error).
+    controller_config:
+      base:
+        motor_type: "position"
+        use_delta_commands: false
+    # Other controllers use UnitreeG1 defaults: camera=JointController, arm_*=InverseKinematicsController,
+    # gripper_*=MultiFingerGripperController. Do not set base to DifferentialDriveController (G1 is humanoid).
     sensor_config:
       VisionSensor:
         sensor_kwargs:

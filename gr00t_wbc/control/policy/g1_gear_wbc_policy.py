@@ -166,6 +166,30 @@ class G1GearWbcPolicy(Policy):
 
         assert self.obs_tensor.shape[1] == self.config["num_obs"]
 
+    def get_last_single_obs_dict(self) -> Optional[Dict[str, Any]]:
+        """Return the last 86-D single-step observation as a dict of labeled segments for dumping.
+
+        Layout: cmd_scaled (3), height_cmd (1), torso_rpy (3), omega_scaled (3),
+        gravity_orientation (3), q_body_scaled (29), dq_body_scaled (29), prev_action_15d (15).
+        Returns None if obs_history is empty.
+        """
+        if not self.obs_history or len(self.obs_history) == 0:
+            return None
+        single_obs = np.asarray(self.obs_history[-1], dtype=np.float32).ravel()
+        n_joints = 29  # body joints for G1
+        if len(single_obs) < 86:
+            return None
+        return {
+            "cmd_scaled": single_obs[0:3].tolist(),
+            "height_cmd": single_obs[3:4].tolist(),
+            "torso_rpy": single_obs[4:7].tolist(),
+            "omega_scaled": single_obs[7:10].tolist(),
+            "gravity_orientation": single_obs[10:13].tolist(),
+            "q_body_scaled": single_obs[13 : 13 + n_joints].tolist(),
+            "dq_body_scaled": single_obs[13 + n_joints : 13 + 2 * n_joints].tolist(),
+            "prev_action_15d": single_obs[13 + 2 * n_joints : 13 + 2 * n_joints + 15].tolist(),
+        }
+
     def set_use_teleop_policy_cmd(self, use_teleop_policy_cmd: bool):
         self.use_teleop_policy_cmd = use_teleop_policy_cmd
         # Safety: When teleop is disabled, reset navigation to stop

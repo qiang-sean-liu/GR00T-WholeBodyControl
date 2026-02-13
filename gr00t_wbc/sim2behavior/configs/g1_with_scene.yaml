@@ -25,8 +25,11 @@ env:
         image_height: 480
         image_width: 640
         focal_length: 12.0
+        # ~120° horizontal FOV: FOV = 2*atan(horizontal_aperture/(2*focal_length)) => horizontal_aperture ≈ 3.464*focal_length
+        horizontal_aperture: 41.57
       # Use z=6.0 so the camera is clearly above the room (Rs_int ceiling ~3m); at z=3.5 the
       # camera can end up inside geometry or above origin but not above the robot in some scenes.
+      # When --topdown_follow_robot is used, camera height is clamped to 2m max in the run script.
       position: [0.0, 0.0, 6.0]
       orientation: [0.0, 0.0, 0.0, 1.0]  # identity (look -Z). If you see sky, try --topdown_orientation flip_x
       pose_frame: scene
@@ -55,6 +58,12 @@ robots:
     action_normalize: False
     self_collisions: True
     obs_modalities: ["proprio", "rgb"]
+    # Base (legs + waist) must use position control so WBC joint position commands are tracked.
+    # Override params under "base" (flat dict); do NOT nest under "JointController" (causes unexpected keyword error).
+    controller_config:
+      base:
+        motor_type: "position"
+        use_delta_commands: false
     sensor_config:
       VisionSensor:
         sensor_kwargs:

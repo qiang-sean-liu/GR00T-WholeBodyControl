@@ -124,7 +124,10 @@ class OmniGibsonToGR00TObservationAdapter:
         
         # Check if proprio is a dict (not a tensor)
         if isinstance(proprio, dict):
-            if "qpos" in proprio:
+            if "joint_qpos" in proprio:
+                # OmniGibson _get_proprioception_dict uses this key for all joint positions (n_dof)
+                q = np.asarray(proprio["joint_qpos"])
+            elif "qpos" in proprio:
                 q = np.asarray(proprio["qpos"])
             elif "joint_positions" in proprio:
                 q = np.asarray(proprio["joint_positions"])
@@ -138,10 +141,12 @@ class OmniGibsonToGR00TObservationAdapter:
         elif hasattr(proprio, '__array__'):  # NumPy array or array-like
             q = np.asarray(proprio)
         
-        # Fallback: try direct access on robot_obs
+        # Fallback: try direct access on robot_obs (e.g. run script can add joint_qpos here)
         if q is None or len(q) == 0:
             if isinstance(robot_obs, dict):
-                if "qpos" in robot_obs:
+                if "joint_qpos" in robot_obs:
+                    q = np.asarray(robot_obs["joint_qpos"])
+                elif "qpos" in robot_obs:
                     q = np.asarray(robot_obs["qpos"])
                 elif "joint_positions" in robot_obs:
                     q = np.asarray(robot_obs["joint_positions"])
@@ -217,6 +222,17 @@ class OmniGibsonToGR00TObservationAdapter:
                 if key in proprio:
                     base_ang_vel = np.asarray(proprio[key])[:3]
                     break
+
+        # Fallback: run script may add robot pose/vel to robot_obs (for WBC)
+        if isinstance(robot_obs, dict):
+            if base_pos is None and "robot_pos" in robot_obs:
+                base_pos = np.asarray(robot_obs["robot_pos"])[:3]
+            if base_quat is None and "robot_quat" in robot_obs:
+                base_quat = np.asarray(robot_obs["robot_quat"])[:4]
+            if base_vel is None and "robot_lin_vel" in robot_obs:
+                base_vel = np.asarray(robot_obs["robot_lin_vel"])[:3]
+            if base_ang_vel is None and "robot_ang_vel" in robot_obs:
+                base_ang_vel = np.asarray(robot_obs["robot_ang_vel"])[:3]
         
         # Set defaults if not found
         if base_pos is None:
