@@ -51,6 +51,8 @@ import os
 import sys
 import warnings
 
+import numpy as np
+
 # Suppress noisy Gymnasium warning
 warnings.filterwarnings("ignore", message="Casting input x to numpy array", module="gymnasium.spaces.box")
 
@@ -116,7 +118,6 @@ def _tensor_to_python(obj):
     except Exception:
         pass
     try:
-        import numpy as np
         if isinstance(obj, np.ndarray):
             return obj.tolist()
     except Exception:
@@ -125,6 +126,31 @@ def _tensor_to_python(obj):
         return {k: _tensor_to_python(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_tensor_to_python(x) for x in obj]
+    return obj
+
+
+def _format_number_6(x):
+    """Format a single number as a 6-character string (e.g. -0.650374 -> '-0.650', 1 -> '     1')."""
+    if isinstance(x, bool):
+        return "  True" if x else " False"
+    if isinstance(x, int):
+        s = f"{x:6d}"
+        return s[-6:] if len(s) > 6 else s.rjust(6)
+    if isinstance(x, (float, np.floating)):
+        s = f"{float(x):.4f}"
+        s = s[:6] if len(s) >= 6 else s.rjust(6)
+        return s
+    return str(x)[:6].rjust(6)
+
+
+def _format_dump_6(obj):
+    """Recursively format all numbers in obj (dict/list) to 6-char strings for action dump."""
+    if isinstance(obj, dict):
+        return {k: _format_dump_6(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_format_dump_6(x) for x in obj]
+    if isinstance(obj, (int, float, np.integer, np.floating, bool)):
+        return _format_number_6(obj)
     return obj
 
 
@@ -225,7 +251,6 @@ def _get_camera_extrinsics_per_frame(og, camera_names=None):
                 else:
                     # Try numpy if available
                     try:
-                        import numpy as np
                         matrix = np.array(view_matrix_raw)
                         if matrix.shape == (4, 4):
                             entry["position"] = matrix[:3, 3].tolist()
@@ -352,6 +377,45 @@ def main() -> int:
         type=str,
         default="",
         help="Directory for action dumps (default: <frames_dir>/action_dumps or output_frames/action_dumps).",
+    )
+    parser.add_argument(
+        "--hold_initial_pose",
+        action="store_true",
+        help="Send the initial standing pose (from step-0 observation) as action every step so the robot stands still.",
+    )
+    parser.add_argument(
+        "--inject_standing_reset",
+        action="store_true",
+        help="Inject robot_model.default_body_pose as reset_joint_pos so the robot starts in a standing pose (fixes jump/collapse when no reset_joint_pos in YAML).",
+    )
+    parser.add_argument(
+        "--no_op_first_step",
+        action="store_true",
+        help="On step 0 only, send current pose as action (no-op) so the first transition never uses the policy; avoids snap from policy's first-frame command.",
+    )
+    parser.add_argument(
+        "--clamp_sent_indices_4_10",
+        type=float,
+        default=None,
+        metavar="VALUE",
+        help="Overwrite sent_to_simulator indices 4 and 10 (base DOFs) with this value, e.g. 0.1, to test if they cause snap off floor.",
+    )
+    parser.add_argument(
+        "--clamp_sent_index_14",
+        type=float,
+        default=None,
+        metavar="VALUE",
+        help="Overwrite sent_to_simulator index 14 (base DOF) with this value, e.g. 0.01.",
+    )
+    parser.add_argument(
+        "--zero_base_action",
+        action="store_true",
+        help="Set the first 15 sent_to_simulator values (base/lower-body) to 0. Use with base controller use_delta_commands: true so base holds current pose.",
+    )
+    parser.add_argument(
+        "--enable_full_robot_gravity",
+        action="store_true",
+        help="Re-enable gravity on all robot links (overrides OmniGibson ControllableObject default that disables gravity on non-base links). Use so the robot falls under gravity instead of floating.",
     )
     args = parser.parse_args()
 
@@ -652,6 +716,25 @@ def main() -> int:
                 q_pin[pidx] = float(jpos[og_idx])
         return q_pin.astype(np.float32)
 
+    def _pinocchio_q_to_og_jpos(robot, q_pinocchio: np.ndarray, robot_model) -> np.ndarray:
+        """
+        Convert joint positions from Pinocchio order to OmniGibson articulation order
+        (same as robot.get_joint_positions()). Used to set robot.set_joint_positions() from
+        robot_model.default_body_pose so the robot starts in a standing pose.
+        """
+        q = np.asarray(q_pinocchio, dtype=np.float64).ravel()
+        og_names = getattr(robot, "joint_names", None)
+        if og_names is None and hasattr(robot, "joints") and robot.joints:
+            og_names = list(robot.joints.keys())
+        if og_names is None or len(og_names) == 0:
+            return q
+        jpos_og = np.zeros(len(og_names), dtype=np.float64)
+        for og_idx, og_name in enumerate(og_names):
+            pidx = _pinocchio_name_to_index(robot_model, og_name)
+            if pidx is not None and 0 <= pidx < len(q):
+                jpos_og[og_idx] = float(q[pidx])
+        return jpos_og.astype(np.float32)
+
     def _pinocchio_q_to_controller_order_action(robot, q_pinocchio: np.ndarray, robot_model) -> np.ndarray:
         """
         Convert joint positions from Pinocchio (WBC/robot_model) order to the flat action
@@ -699,6 +782,75 @@ def main() -> int:
             return q
         return np.concatenate(parts).astype(np.float32)
 
+    def _verify_wbc_omnigibson_mapping(robot, robot_model, verbose: bool):
+        """
+        Verify that every joint in OmniGibson controller order maps to a valid Pinocchio index.
+        Logs mapping summary and warns on any unmapped joints (they receive 0.0 in action).
+        """
+        names_in_order = _get_controller_order_joint_names(robot)
+        if names_in_order is None:
+            if verbose:
+                print("WBC–OmniGibson mapping: could not get controller-order joint names (skip verification).")
+            return
+        adim = getattr(robot, "action_dim", None)
+        if adim is not None and len(names_in_order) != adim:
+            print(
+                f"WBC–OmniGibson mapping WARNING: controller-order joints ({len(names_in_order)}) != robot.action_dim ({adim})",
+                file=sys.stderr,
+            )
+        unmapped = []
+        mapping_ok = []
+        for i, og_name in enumerate(names_in_order):
+            pidx = _pinocchio_name_to_index(robot_model, og_name)
+            if pidx is None:
+                unmapped.append((i, og_name))
+            else:
+                mapping_ok.append((i, og_name, pidx))
+        if unmapped:
+            print(
+                f"WBC–OmniGibson mapping: {len(unmapped)} joint(s) have no Pinocchio match (will get 0.0): {[n for _, n in unmapped]}",
+                file=sys.stderr,
+            )
+        if verbose and mapping_ok:
+            print("WBC–OmniGibson mapping (controller_order -> Pinocchio index):")
+            for i, og_name, pidx in mapping_ok[:20]:
+                print(f"  [{i}] {og_name} -> q[{pidx}]")
+            if len(mapping_ok) > 20:
+                print(f"  ... and {len(mapping_ok) - 20} more.")
+        if not unmapped and verbose:
+            print("WBC–OmniGibson mapping: all controller-order joints map to Pinocchio indices.")
+
+    # Verify WBC <-> OmniGibson joint mapping once at startup
+    if env.robots and robot_model is not None:
+        _verify_wbc_omnigibson_mapping(env.robots[0], robot_model, args.verbose)
+
+    # Optional: inject standing pose as reset_joint_pos so the robot starts standing (major fix for jump/collapse).
+    # G1 has no reset_joint_pos in YAML -> OmniGibson uses zeros -> unstable; hold/zero position/velocity all fail.
+    if args.inject_standing_reset and env.robots and robot_model is not None and hasattr(robot_model, "default_body_pose"):
+        robot = env.robots[0]
+        standing_pinocchio = np.asarray(robot_model.default_body_pose).ravel()
+        if len(standing_pinocchio) >= getattr(robot_model, "num_joints", 0) and "robots" in env_config and len(env_config["robots"]) > 0:
+            standing_og = _pinocchio_q_to_og_jpos(robot, standing_pinocchio, robot_model)
+            try:
+                env.close()
+            except Exception:
+                pass
+            # Simulator must be stopped before loading scene when creating a new Environment.
+            if hasattr(og, "sim") and og.sim is not None and not og.sim.is_stopped():
+                og.sim.stop()
+            env_config["robots"][0] = dict(env_config["robots"][0])
+            env_config["robots"][0]["reset_joint_pos"] = standing_og.tolist()
+            env = og.Environment(configs=env_config)
+            print("inject_standing_reset: set reset_joint_pos from robot_model.default_body_pose; recreated env.")
+
+    # Re-enable gravity on all robot links so the robot falls instead of floating (ControllableObject disables it on non-base links).
+    if args.enable_full_robot_gravity and env.robots:
+        for robot in env.robots:
+            if hasattr(robot, "enable_gravity"):
+                robot.enable_gravity()
+        if args.verbose:
+            print("enable_full_robot_gravity: enabled gravity on all robot links.")
+
     # WBC (Whole-Body Control) for sim2behavior: same as RoboCasa locomanip pipeline
     wbc_policy = None
     concat_action = None
@@ -726,7 +878,6 @@ def main() -> int:
             return 1
 
     # Setup video saving (optional)
-    import numpy as np
     frames_dir = None
     camera_frames = {}
     if args.save_video:
@@ -867,6 +1018,10 @@ def main() -> int:
     og_obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
     current_q = None  # Track current joint state for action adapter
 
+    # initial_standing_pose for --hold_initial_pose is captured from the sim at step 0 only (see loop below).
+    # We do NOT use robot_model.default_body_pose here: it does not match OmniGibson's G1 (causes floating, legs backwards, flying).
+    initial_standing_pose = None
+
     # Dump camera params (D435, mid360, topdown, etc.) when DUMP_CAMERAS=1
     if os.environ.get("DUMP_CAMERAS", "").lower() in ("1", "true", "t"):
         _dump_camera_params(og, frames_dir or os.path.join(SIM2BEHAVIOR_ROOT, "output_frames"))
@@ -891,6 +1046,8 @@ def main() -> int:
         dump_actions_file = open(dump_actions_path, "w", buffering=1)
         print(f"Action dumps enabled: writing to {dump_actions_path}")
 
+    # initial_standing_pose already set above when --hold_initial_pose (from default_body_pose); else None
+
     for step in range(args.max_steps):
         if step % 100 == 0:
             print(f"Step {step} of {args.max_steps}")
@@ -909,6 +1066,7 @@ def main() -> int:
 
         # OmniGibson returns proprio as a concatenated vector, not a dict with joint_qpos/joint_velocities.
         # Enrich obs with joint positions, joint velocities, and (for WBC) base pose/velocity.
+        jpos_og_raw = None  # OG-order joint positions (for --hold_initial_pose capture, step 0 only)
         if robot_name_in_config in og_obs and env.robots:
             robot = env.robots[0]
             jpos = robot.get_joint_positions()
@@ -916,6 +1074,9 @@ def main() -> int:
                 jpos = jpos.detach().cpu().numpy()
             else:
                 jpos = np.asarray(jpos)
+            # Keep raw OG-order copy for hold_initial_pose / no_op_first_step so we send exactly what the sim expects (no Pinocchio mapping).
+            if step == 0 and (args.hold_initial_pose or args.no_op_first_step):
+                jpos_og_raw = np.asarray(jpos).ravel().copy()
             # Convert to Pinocchio order so policy/WBC see correct joint-to-index mapping (body_indices, etc.)
             if robot_model is not None:
                 jpos = _og_jpos_to_pinocchio_q(robot, jpos, robot_model)
@@ -953,6 +1114,44 @@ def main() -> int:
         gr00t_obs = obs_adapter.adapt(og_obs, verbose=(args.verbose and step == 0))
         # Use current observation's q for action adapter (always from latest state)
         current_q = gr00t_obs["q"].copy()
+        # Build step-0 no-op action (current pose) so first transition doesn't use policy (--no_op_first_step).
+        step0_no_op_action = None
+        if args.no_op_first_step and step == 0 and env.robots and robot_model is not None:
+            robot = env.robots[0]
+            if jpos_og_raw is not None and len(jpos_og_raw) > 0:
+                step0_no_op_action = {
+                    robot_name_in_config: _to_robot_action_dim(
+                        robot, _joint_positions_to_controller_order_action(robot, jpos_og_raw)
+                    ).copy()
+                }
+            else:
+                q0 = np.asarray(current_q, dtype=np.float64).ravel()
+                if len(q0) >= robot_model.num_joints:
+                    step0_no_op_action = {
+                        robot_name_in_config: _pinocchio_q_to_controller_order_action(robot, q0, robot_model).copy()
+                    }
+        # Capture initial standing pose once at step 0 for --hold_initial_pose.
+        # Use simulator joint positions in OG order -> controller order (no Pinocchio) so the action
+        # is exactly what the sim expects and the robot holds still. Pinocchio-based capture can
+        # mis-map (base vs joints, name mismatches) and cause the robot to jump.
+        if args.hold_initial_pose and step == 0 and env.robots and initial_standing_pose is None:
+            robot = env.robots[0]
+            if jpos_og_raw is not None and len(jpos_og_raw) > 0:
+                initial_standing_pose = {
+                    robot_name_in_config: _to_robot_action_dim(
+                        robot, _joint_positions_to_controller_order_action(robot, jpos_og_raw)
+                    ).copy()
+                }
+                if args.verbose:
+                    print("hold_initial_pose: captured initial standing pose from step-0 sim joint positions (OG->controller order).")
+            elif robot_model is not None:
+                q0 = np.asarray(current_q, dtype=np.float64).ravel()
+                if len(q0) >= robot_model.num_joints:
+                    initial_standing_pose = {
+                        robot_name_in_config: _pinocchio_q_to_controller_order_action(robot, q0, robot_model).copy()
+                    }
+                    if args.verbose:
+                        print("hold_initial_pose: captured initial standing pose from step-0 observation (Pinocchio fallback).")
         if args.verbose and step == 0:
             print(f"GR00T obs keys: {list(gr00t_obs.keys())}")
             print(f"Camera images: {[k for k in gr00t_obs.keys() if 'image' in k or 'video' in k]}")
@@ -1063,9 +1262,58 @@ def main() -> int:
                     robot, _joint_positions_to_controller_order_action(robot, q_vec)
                 )
 
+        # Optionally send initial standing pose every step (robot holds still)
+        if args.hold_initial_pose and initial_standing_pose is not None:
+            og_action = copy.deepcopy(initial_standing_pose)
+
+        # On step 0 only: send current pose (no-op) so first transition never uses policy (avoids snap).
+        if step == 0 and args.no_op_first_step and step0_no_op_action is not None:
+            og_action = copy.deepcopy(step0_no_op_action)
+
+        # Optional: clamp sent_to_simulator indices to fixed values (e.g. 4 and 10 to 0.1, 14 to 0.01) to test snap.
+        if (
+            (args.clamp_sent_indices_4_10 is not None or args.clamp_sent_index_14 is not None)
+            and isinstance(og_action, dict)
+            and robot_name_in_config in og_action
+        ):
+            arr = np.asarray(og_action[robot_name_in_config], dtype=np.float64).copy()
+            if args.clamp_sent_indices_4_10 is not None and len(arr) > 10:
+                arr[4] = arr[10] = float(args.clamp_sent_indices_4_10)
+            if args.clamp_sent_index_14 is not None and len(arr) > 14:
+                arr[14] = float(args.clamp_sent_index_14)
+            og_action[robot_name_in_config] = arr
+
+        # Optional: zero the 15 base (lower-body) joints (for use with base use_delta_commands: true to hold pose).
+        # When zero_base_action is not set, the first 15 values come from WBC lower-body (real ONNX/WBC actions).
+        if args.zero_base_action and isinstance(og_action, dict) and robot_name_in_config in og_action:
+            arr = np.asarray(og_action[robot_name_in_config], dtype=np.float64).copy()
+            if len(arr) >= 15:
+                arr[0:15] = 0.0
+                og_action[robot_name_in_config] = arr
+
         # Write per-step action dump to single text file (JSON Lines: one JSON object per step)
         if dump_actions_file is not None and gr00t_action_for_dump is not None:
+            # On first step, write controller-order joint names so sent_to_simulator indices can be labeled
+            if step == 0 and env.robots:
+                try:
+                    robot = env.robots[0]
+                    names_in_order = _get_controller_order_joint_names(robot)
+                    if names_in_order and dump_actions_path is not None:
+                        names_path = os.path.join(os.path.dirname(dump_actions_path), "controller_order_joint_names.txt")
+                        with open(names_path, "w") as f:
+                            f.write("# sent_to_simulator index -> joint name (controller order)\n")
+                            for i, name in enumerate(names_in_order):
+                                f.write(f"{i}\t{name}\n")
+                        if args.verbose:
+                            print(f"Wrote controller-order joint names to {names_path}")
+                except Exception as e:
+                    if args.verbose:
+                        print(f"Could not write controller-order joint names: {e}", file=sys.stderr)
             step_dict = {"step": step}
+            if args.hold_initial_pose:
+                step_dict["hold_initial_pose"] = True
+            if step == 0 and args.no_op_first_step:
+                step_dict["no_op_first_step"] = True
             gr00t_serial = {}
             _T = 30  # policy action horizon
             for k, v in gr00t_action_for_dump.items():
@@ -1098,6 +1346,10 @@ def main() -> int:
                         onnx_86 = lb.get_last_single_obs_dict()
                         if onnx_86 is not None:
                             step_dict["onnx_input_86"] = onnx_86
+            # Include the exact action sent to the simulator
+            step_dict["sent_to_simulator"] = _tensor_to_python(copy.deepcopy(og_action))
+            # Format all numbers as 6-character strings
+            step_dict = _format_dump_6(step_dict)
             try:
                 dump_actions_file.write(json.dumps(step_dict) + "\n")
                 dump_actions_file.flush()
@@ -1105,7 +1357,7 @@ def main() -> int:
                 if args.verbose:
                     print(f"Action dump write failed for step {step}: {e}", file=sys.stderr)
 
-        # The adapter should return the correct format, but ensure it's valid
+        # The adapter should return the correct format; ensure it's valid
         if args.verbose and step == 0:
             if isinstance(og_action, dict):
                 print(f"OmniGibson action type: dict, keys: {list(og_action.keys())}")
