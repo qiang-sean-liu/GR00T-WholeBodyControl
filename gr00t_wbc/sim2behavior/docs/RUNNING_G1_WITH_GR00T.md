@@ -127,6 +127,27 @@ python scripts/analyze_wbc_actions.py [path/to/actions_dump.jsonl] [-o summary.t
 
 This reports: (1) smoothness of WBC inputs and outputs; (2) upper-body tracking (goal vs output); (3) lower-body summary (smoothness of `wbc.q[0:15]` and command stats). For how the lower body is controlled and what the ONNX model receives, see [WBC_LOWER_BODY_INPUT_OUTPUT.md](WBC_LOWER_BODY_INPUT_OUTPUT.md). Use the same environment that has `numpy`.
 
+### Rollout dump format (WBC parity)
+
+When running **WBC parity tests** (hijacking WBC from a Mujoco rollout dump via `--wbc_input_dump` and `--wbc_output_compare`), the rollout JSONL (`actions_dump_from_rollout.jsonl`) should include full WBC observation so OmniGibson uses the same inputs as Mujoco. In particular, each line’s **`observation_sim`** should contain:
+
+- **`q`**, **`dq`** – full state in Pinocchio order (already present in typical dumps).
+- **`floating_base_pose`** – 7 floats: `[x, y, z, qx, qy, qz, qw]` (base position + quaternion).
+- **`floating_base_vel`** – 6 floats: `[vx, vy, vz, wx, wy, wz]` (linear and angular velocity).
+
+If the code that writes the rollout dump (e.g. MuJoCo client with `WholeBodyControlWrapper`) does not yet write these two keys, add them from the same observation passed to WBC: `obs["floating_base_pose"]` and `obs["floating_base_vel"]` (e.g. from `qpos[:7]` and `qvel[:6]` in MuJoCo).
+
+**Backfilling an existing dump:** If you only have `q` and `dq` in Pinocchio order (base first), you can add the two fields without re-running the rollout:
+
+```bash
+# Write to a new file:
+python scripts/add_floating_base_to_rollout_dump.py input.jsonl -o output_with_fb.jsonl
+# Or overwrite in place:
+python scripts/add_floating_base_to_rollout_dump.py input.jsonl --inplace
+```
+
+The script sets `floating_base_pose = q[:7]` and `floating_base_vel = dq[:6]` for each line.
+
 ### Prerequisites
 
 - BEHAVIOR/OmniGibson virtual environment must be activated.

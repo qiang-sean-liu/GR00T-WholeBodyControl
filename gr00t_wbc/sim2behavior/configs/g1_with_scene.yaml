@@ -13,9 +13,9 @@
 # Same camera/robot settings as g1_standalone.yaml; only the scene section differs.
 
 env:
-  action_frequency: 30
-  rendering_frequency: 30
-  physics_frequency: 120
+  action_frequency: 50      # Match Mujoco: control_decimation=4 at 200Hz → 50Hz control
+  rendering_frequency: 50
+  physics_frequency: 200    # Match Mujoco: simulation_dt=0.005 → 200Hz
   external_sensors:
     - sensor_type: VisionSensor
       name: topdown_camera
@@ -58,29 +58,50 @@ robots:
     action_normalize: False
     self_collisions: True
     obs_modalities: ["proprio", "rgb"]
+    # reset_joint_pos is computed at runtime by the run script using
+    # _pinocchio_q_to_og_jpos(robot, robot_model.default_body_pose, robot_model).
+    # DO NOT hardcode it here: the OG articulation order is breadth-first / interleaved
+    # (left_hip_pitch, right_hip_pitch, waist_yaw, left_hip_roll, ...), NOT sequential
+    # (left_leg, right_leg, waist).  A wrong order causes the robot to collapse.
     # WBC outputs joint positions; all controllers must use JointController with position and no delta.
     # Base (legs + waist), arms, and hands (grippers) are all joint-space for consistency with RoboCasa.
+    # isaac_kp / isaac_kd: PhysX position-drive stiffness/damping matching Mujoco PD gains.
+    # Mujoco source: g1_gear_wbc.yaml  kps/kds (lower body); robosuite default kp=50 (upper body).
     controller_config:
       base:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false   # base receives absolute joint targets from WBC lower-body (15d)
+        isaac_kp: [150.0, 150.0, 150.0, 200.0, 40.0, 40.0,
+                   150.0, 150.0, 150.0, 200.0, 40.0, 40.0,
+                   250.0, 250.0, 250.0]
+        isaac_kd: [2.0, 2.0, 2.0, 4.0, 2.0, 2.0,
+                   2.0, 2.0, 2.0, 4.0, 2.0, 2.0,
+                   5.0, 5.0, 5.0]
       arm_left:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false
+        isaac_kp: 50.0
+        isaac_kd: 14.14
       arm_right:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false
+        isaac_kp: 50.0
+        isaac_kd: 14.14
       gripper_left:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false
+        isaac_kp: 50.0
+        isaac_kd: 14.14
       gripper_right:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false
+        isaac_kp: 50.0
+        isaac_kd: 14.14
     sensor_config:
       VisionSensor:
         sensor_kwargs:

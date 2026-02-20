@@ -49,14 +49,29 @@ robots:
     action_normalize: False
     self_collisions: True
     obs_modalities: ["proprio", "rgb"]
-    # Base (legs + waist) must use position control so WBC joint position commands are tracked.
-    # Override params under "base" (flat dict); do NOT nest under "JointController" (causes unexpected keyword error).
+    # WBC outputs joint positions; all controllers must use JointController with position and no delta.
+    # Base (legs + waist), arms, and hands (grippers) are all joint-space for consistency with RoboCasa.
     controller_config:
       base:
+        name: "JointController"
+        motor_type: "position"
+        use_delta_commands: false   # base receives absolute joint targets from WBC lower-body (15d)
+      arm_left:
+        name: "JointController"
         motor_type: "position"
         use_delta_commands: false
-    # Other controllers use UnitreeG1 defaults: camera=JointController, arm_*=InverseKinematicsController,
-    # gripper_*=MultiFingerGripperController. Do not set base to DifferentialDriveController (G1 is humanoid).
+      arm_right:
+        name: "JointController"
+        motor_type: "position"
+        use_delta_commands: false
+      gripper_left:
+        name: "JointController"
+        motor_type: "position"
+        use_delta_commands: false
+      gripper_right:
+        name: "JointController"
+        motor_type: "position"
+        use_delta_commands: false
     sensor_config:
       VisionSensor:
         sensor_kwargs:

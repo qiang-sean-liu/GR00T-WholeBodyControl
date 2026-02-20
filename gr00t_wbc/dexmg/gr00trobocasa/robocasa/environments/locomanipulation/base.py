@@ -177,13 +177,13 @@ class LocoManipulationEnv(ManipulationEnv, metaclass=LocoManipulationEnvMeta):
         "GR1ArmsOnlyInspireHands": [0, 0, 0.97],
         "GR1ArmsOnlyFourierHands": [0, 0, 0.97],
         "GR1ArmsAndWaistFourierHands": [0, 0, 0.97],
-        "G1": [0, 0, 0.793],
-        "G1FixedBase": [0, 0, 0.793],
-        "G1FixedLowerBody": [0, 0, 0.793],
-        "G1ArmsOnly": [0, 0, 0.793],
-        "G1ArmsOnlyFloating": [0, 0, 0.793],
-        "G1FloatingBody": [0, 0, 0.793],
-        "G1FloatingBodyWithVertical": [0, 0, 0.793],
+        "G1": [0, 0, 0.85],
+        "G1FixedBase": [0, 0, 0.85],
+        "G1FixedLowerBody": [0, 0, 0.85],
+        "G1ArmsOnly": [0, 0, 0.85],
+        "G1ArmsOnlyFloating": [0, 0, 0.85],
+        "G1FloatingBody": [0, 0, 0.85],
+        "G1FloatingBodyWithVertical": [0, 0, 0.85],
     }
 
     def __init__(

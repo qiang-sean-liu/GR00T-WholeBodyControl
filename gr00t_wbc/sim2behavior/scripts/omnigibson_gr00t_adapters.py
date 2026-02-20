@@ -108,48 +108,36 @@ class OmniGibsonToGR00TObservationAdapter:
         if verbose:
             print(f"Robot obs keys for '{self.robot_name}': {list(robot_obs.keys()) if isinstance(robot_obs, dict) else type(robot_obs)}")
 
-        # Extract joint state from OmniGibson proprio
-        # OmniGibson may structure proprio differently; try multiple possible keys
-        # Handle case where proprio might be a tensor or dict
-        proprio = robot_obs.get("proprio", {})
-        if verbose and proprio:
-            if isinstance(proprio, dict):
-                print(f"Proprio keys: {list(proprio.keys())}")
-            else:
-                print(f"Proprio type: {type(proprio)}, shape: {getattr(proprio, 'shape', 'N/A')}")
-
-        # Try different possible key names for joint positions/velocities
+        # Extract joint state.
+        # IMPORTANT: Prefer robot_obs["joint_qpos"] (set by the run script in
+        # Pinocchio order) over the raw OG proprio tensor.  OmniGibson's proprio
+        # is a *flat* concatenation of sin/cos encodings, velocities, EEF poses,
+        # etc.—NOT raw joint positions.  Taking its first N elements would give
+        # sin(base_joints) instead of actual positions.
         q = None
         dq = None
-        
-        # Check if proprio is a dict (not a tensor)
-        if isinstance(proprio, dict):
-            if "joint_qpos" in proprio:
-                # OmniGibson _get_proprioception_dict uses this key for all joint positions (n_dof)
-                q = np.asarray(proprio["joint_qpos"])
-            elif "qpos" in proprio:
-                q = np.asarray(proprio["qpos"])
-            elif "joint_positions" in proprio:
-                q = np.asarray(proprio["joint_positions"])
-            elif "q" in proprio:
-                q = np.asarray(proprio["q"])
-            elif "joints" in proprio and isinstance(proprio["joints"], dict):
-                q = np.asarray(proprio["joints"].get("positions", []))
-        elif hasattr(proprio, 'numpy'):  # PyTorch tensor
-            # If proprio is a tensor, it might be the joint positions directly
-            q = np.asarray(proprio.detach().cpu().numpy() if hasattr(proprio, 'detach') else proprio.numpy())
-        elif hasattr(proprio, '__array__'):  # NumPy array or array-like
-            q = np.asarray(proprio)
-        
-        # Fallback: try direct access on robot_obs (e.g. run script can add joint_qpos here)
+        proprio = robot_obs.get("proprio", {}) if isinstance(robot_obs, dict) else {}
+
+        if isinstance(robot_obs, dict):
+            for key in ("joint_qpos", "qpos", "joint_positions", "q"):
+                if key in robot_obs:
+                    q = np.asarray(robot_obs[key])
+                    break
+
+        # Fall back to proprio only if no explicit joint data was provided
         if q is None or len(q) == 0:
-            if isinstance(robot_obs, dict):
-                if "joint_qpos" in robot_obs:
-                    q = np.asarray(robot_obs["joint_qpos"])
-                elif "qpos" in robot_obs:
-                    q = np.asarray(robot_obs["qpos"])
-                elif "joint_positions" in robot_obs:
-                    q = np.asarray(robot_obs["joint_positions"])
+            if verbose and proprio is not None:
+                if isinstance(proprio, dict):
+                    print(f"Proprio keys: {list(proprio.keys())}")
+                else:
+                    print(f"Proprio type: {type(proprio)}, shape: {getattr(proprio, 'shape', 'N/A')}")
+            if isinstance(proprio, dict):
+                for key in ("joint_qpos", "qpos", "joint_positions", "q"):
+                    if key in proprio:
+                        q = np.asarray(proprio[key])
+                        break
+                if q is None and "joints" in proprio and isinstance(proprio["joints"], dict):
+                    q = np.asarray(proprio["joints"].get("positions", []))
 
         if q is None or len(q) == 0:
             if verbose:
@@ -163,24 +151,21 @@ class OmniGibsonToGR00TObservationAdapter:
             else:
                 q = q[:self.robot_model.num_joints]
 
-        # Extract velocities (similar logic)
-        if isinstance(proprio, dict):
-            if "qvel" in proprio:
-                dq = np.asarray(proprio["qvel"])
-            elif "joint_velocities" in proprio:
-                dq = np.asarray(proprio["joint_velocities"])
-            elif "dq" in proprio:
-                dq = np.asarray(proprio["dq"])
-            elif "joints" in proprio and isinstance(proprio["joints"], dict):
-                dq = np.asarray(proprio["joints"].get("velocities", []))
-        # If proprio is a tensor, velocities might be in a separate key or not available
-        
-        # Fallback: try direct access on robot_obs
-        if (dq is None or len(dq) == 0) and isinstance(robot_obs, dict):
-            if "qvel" in robot_obs:
-                dq = np.asarray(robot_obs["qvel"])
-            elif "joint_velocities" in robot_obs:
-                dq = np.asarray(robot_obs["joint_velocities"])
+        # Extract velocities (same priority: robot_obs first, proprio fallback)
+        if isinstance(robot_obs, dict):
+            for key in ("joint_velocities", "qvel", "dq"):
+                if key in robot_obs:
+                    dq = np.asarray(robot_obs[key])
+                    break
+
+        if (dq is None or len(dq) == 0):
+            if isinstance(proprio, dict):
+                for key in ("joint_velocities", "qvel", "dq"):
+                    if key in proprio:
+                        dq = np.asarray(proprio[key])
+                        break
+                if dq is None and "joints" in proprio and isinstance(proprio["joints"], dict):
+                    dq = np.asarray(proprio["joints"].get("velocities", []))
 
         if dq is None or len(dq) == 0:
             dq = np.zeros_like(q)

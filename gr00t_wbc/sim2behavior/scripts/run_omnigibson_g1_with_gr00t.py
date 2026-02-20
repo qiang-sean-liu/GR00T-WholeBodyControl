@@ -41,6 +41,16 @@ With Whole-Body Control (WBC) for lower-body locomotion, same as RoboCasa locoma
 
 Dump per-step actions (raw GR00T, WBC goal, WBC output) for debugging:
     python scripts/run_omnigibson_g1_with_gr00t.py ... --dump_actions [--dump_actions_dir /path]
+
+WBC parity test (hijack WBC inputs from Mujoco rollout dump, compare outputs and obs after step):
+    python scripts/run_omnigibson_g1_with_gr00t.py ... --use_wbc \\
+        --wbc_input_dump path/to/actions_dump_from_rollout.jsonl \\
+        --wbc_output_compare path/to/omnigibson_wbc_output.jsonl
+    Ensures: (1) WBC inputs match when dump has observation_sim.floating_base_pose/vel and
+    target_upper_body_pose is 28-D (arms+hands; we use indices 3:31 when dump has 31-D).
+    (2) Compare wbc_q vs wbc_action. (3) Compare file includes observation_after_step (q, dq)
+    to compare with Mujoco rollout[step+1]["observation_sim"]. Run compare_wbc_outputs.py on
+    the two files to report all three.
 """
 from __future__ import annotations
 
@@ -417,6 +427,18 @@ def main() -> int:
         action="store_true",
         help="Re-enable gravity on all robot links (overrides OmniGibson ControllableObject default that disables gravity on non-base links). Use so the robot falls under gravity instead of floating.",
     )
+    parser.add_argument(
+        "--wbc_input_dump",
+        type=str,
+        default="",
+        help="Path to actions_dump_from_rollout.jsonl; when set with --wbc_output_compare and --use_wbc, hijack WBC observation and goal from this dump each step for parity testing.",
+    )
+    parser.add_argument(
+        "--wbc_output_compare",
+        type=str,
+        default="",
+        help="Path to write OmniGibson WBC output (one JSONL line per step: step, wbc_q) when hijacking from --wbc_input_dump; compare with wbc_action in the input dump.",
+    )
     args = parser.parse_args()
 
     # Set OMNIGIBSON_SKIP_CLOSE if --skip_close flag is used
@@ -756,6 +778,24 @@ def main() -> int:
                 out.append(0.0)
         return _to_robot_action_dim(robot, np.array(out, dtype=np.float32))
 
+    def _controller_order_action_to_pinocchio_q(robot, action_controller: np.ndarray, robot_model) -> np.ndarray:
+        """
+        Convert controller-order action (as sent to env.step()) back to Pinocchio q order
+        for comparison with Mujoco wbc_action. Unmapped indices are zero.
+        """
+        action = np.asarray(action_controller, dtype=np.float64).ravel()
+        names_in_order = _get_controller_order_joint_names(robot)
+        if names_in_order is None:
+            return np.zeros(robot_model.num_joints, dtype=np.float64)
+        q = np.zeros(robot_model.num_joints, dtype=np.float64)
+        for ctrl_idx, og_name in enumerate(names_in_order):
+            if ctrl_idx >= len(action):
+                break
+            pidx = _pinocchio_name_to_index(robot_model, og_name)
+            if pidx is not None and 0 <= pidx < robot_model.num_joints:
+                q[pidx] = float(action[ctrl_idx])
+        return q
+
     def _joint_positions_to_controller_order_action(robot, q_mapped: np.ndarray) -> np.ndarray:
         """
         Convert joint positions (in robot dof order) to controller-order flat action.
@@ -824,24 +864,22 @@ def main() -> int:
     if env.robots and robot_model is not None:
         _verify_wbc_omnigibson_mapping(env.robots[0], robot_model, args.verbose)
 
-    # Optional: inject standing pose as reset_joint_pos so the robot starts standing (major fix for jump/collapse).
-    # G1 has no reset_joint_pos in YAML -> OmniGibson uses zeros -> unstable; hold/zero position/velocity all fail.
-    if args.inject_standing_reset and env.robots and robot_model is not None and hasattr(robot_model, "default_body_pose"):
+    # Always fix reset_joint_pos to correct OG articulation order.
+    # YAML reset_joint_pos is in pinocchio/sequential order (left_leg, right_leg, waist, ...)
+    # but OG articulation order is breadth-first (interleaved: left_hip_pitch, right_hip_pitch,
+    # waist_yaw, left_hip_roll, right_hip_roll, waist_roll, ...).  Using the wrong order causes
+    # the robot to start in a completely wrong pose and collapse.
+    if env.robots and robot_model is not None and hasattr(robot_model, "default_body_pose"):
         robot = env.robots[0]
         standing_pinocchio = np.asarray(robot_model.default_body_pose).ravel()
-        if len(standing_pinocchio) >= getattr(robot_model, "num_joints", 0) and "robots" in env_config and len(env_config["robots"]) > 0:
-            standing_og = _pinocchio_q_to_og_jpos(robot, standing_pinocchio, robot_model)
-            try:
-                env.close()
-            except Exception:
-                pass
-            # Simulator must be stopped before loading scene when creating a new Environment.
-            if hasattr(og, "sim") and og.sim is not None and not og.sim.is_stopped():
-                og.sim.stop()
-            env_config["robots"][0] = dict(env_config["robots"][0])
-            env_config["robots"][0]["reset_joint_pos"] = standing_og.tolist()
-            env = og.Environment(configs=env_config)
-            print("inject_standing_reset: set reset_joint_pos from robot_model.default_body_pose; recreated env.")
+        standing_og = _pinocchio_q_to_og_jpos(robot, standing_pinocchio, robot_model)
+        import torch as th
+        robot.reset_joint_pos = th.tensor(standing_og, dtype=th.float)
+        og_names = list(getattr(robot, "joint_names", []) or [])
+        print(f"Fixed reset_joint_pos: pinocchio→OG order ({len(standing_og)}D)")
+        if og_names:
+            print(f"  OG articulation order (first 15): {og_names[:15]}")
+            print(f"  Standing pose OG[0:15]: {[round(float(v), 4) for v in standing_og[:15]]}")
 
     # Re-enable gravity on all robot links so the robot falls instead of floating (ControllableObject disables it on non-base links).
     if args.enable_full_robot_gravity and env.robots:
@@ -876,6 +914,23 @@ def main() -> int:
             import traceback
             traceback.print_exc()
             return 1
+
+    # WBC parity test: load rollout dump and open compare file when hijacking WBC inputs
+    wbc_dump_lines = None
+    wbc_compare_file = None
+    upper_body_len = None
+    if (
+        args.use_wbc
+        and wbc_policy is not None
+        and args.wbc_input_dump
+        and args.wbc_output_compare
+        and os.path.isfile(args.wbc_input_dump)
+    ):
+        with open(args.wbc_input_dump) as f:
+            wbc_dump_lines = [json.loads(line) for line in f if line.strip()]
+        upper_body_len = len(robot_model.get_joint_group_indices("upper_body"))
+        wbc_compare_file = open(args.wbc_output_compare, "w", buffering=1)
+        print(f"WBC parity: hijacking from {args.wbc_input_dump} ({len(wbc_dump_lines)} steps), writing to {args.wbc_output_compare} (upper_body_len={upper_body_len})")
 
     # Setup video saving (optional)
     frames_dir = None
@@ -1049,6 +1104,9 @@ def main() -> int:
     # initial_standing_pose already set above when --hold_initial_pose (from default_body_pose); else None
 
     for step in range(args.max_steps):
+        last_wbc_q_for_compare = None
+        last_wbc_input_for_compare = None
+        last_og_action_for_compare = None
         if step % 100 == 0:
             print(f"Step {step} of {args.max_steps}")
 
@@ -1082,6 +1140,10 @@ def main() -> int:
                 jpos = _og_jpos_to_pinocchio_q(robot, jpos, robot_model)
             if isinstance(og_obs[robot_name_in_config], dict):
                 og_obs[robot_name_in_config]["joint_qpos"] = jpos
+                # Remove raw proprio tensor so the adapter uses our Pinocchio-
+                # reordered joint_qpos instead of the OG flat proprio (which
+                # contains sin/cos encodings, NOT raw joint positions).
+                og_obs[robot_name_in_config].pop("proprio", None)
                 # Joint velocities: same OG->Pinocchio mapping so adapter/WBC get observation["dq"] and dq_body_scaled != 0
                 try:
                     jvel = robot.get_joint_velocities()
@@ -1094,21 +1156,27 @@ def main() -> int:
                     og_obs[robot_name_in_config]["joint_velocities"] = jvel.astype(np.float32)
                 except Exception:
                     pass
-                # Base pose/vel for WBC and policy (adapter uses robot_pos, robot_quat, etc.)
+                # Base pose for WBC and policy (adapter uses robot_pos, robot_quat, etc.)
                 try:
                     pos, ori = robot.get_position_orientation(frame="world")
                     pos = pos.detach().cpu().numpy() if hasattr(pos, "cpu") else np.asarray(pos)
                     ori = ori.detach().cpu().numpy() if hasattr(ori, "cpu") else np.asarray(ori)
                     og_obs[robot_name_in_config]["robot_pos"] = pos[:3]
-                    og_obs[robot_name_in_config]["robot_quat"] = ori[:4]  # x,y,z,w
-                    lin = robot.get_linear_velocity(frame="world")
-                    ang = robot.get_angular_velocity(frame="world")
+                    og_obs[robot_name_in_config]["robot_quat"] = ori[:4]  # xyzw
+                except Exception as e:
+                    if step == 0:
+                        print(f"[WARNING] get_position_orientation failed at step {step}: {e}", file=sys.stderr)
+                # Base velocity (separate try/except so position is not lost on velocity failure)
+                try:
+                    lin = robot.get_linear_velocity()
+                    ang = robot.get_angular_velocity()
                     lin = lin.detach().cpu().numpy() if hasattr(lin, "cpu") else np.asarray(lin)
                     ang = ang.detach().cpu().numpy() if hasattr(ang, "cpu") else np.asarray(ang)
                     og_obs[robot_name_in_config]["robot_lin_vel"] = lin[:3]
                     og_obs[robot_name_in_config]["robot_ang_vel"] = ang[:3]
-                except Exception:
-                    pass
+                except Exception as e:
+                    if step == 0:
+                        print(f"[WARNING] get_linear/angular_velocity failed at step {step}: {e}", file=sys.stderr)
 
         # Adapt OmniGibson observation to GR00T format
         gr00t_obs = obs_adapter.adapt(og_obs, verbose=(args.verbose and step == 0))
@@ -1177,7 +1245,97 @@ def main() -> int:
                     gr00t_action_for_dump[k] = np.asarray(v)
 
         # Apply WBC (same as RoboCasa locomanip): GR00T -> concat_action -> WBC policy -> full q
-        if wbc_policy is not None and concat_action is not None:
+        # Parity test: when --wbc_input_dump and --wbc_output_compare are set, hijack WBC inputs from the dump and compare output.
+        if wbc_policy is not None and wbc_dump_lines is not None and step < len(wbc_dump_lines):
+            # Hijack WBC observation and goal from Mujoco rollout dump for parity testing.
+            # Use exact same inputs as Mujoco: q, dq, floating_base_pose, floating_base_vel, and goal (28-D upper body = arms+hands only).
+            try:
+                record = wbc_dump_lines[step]
+                # Dump may have list values (e.g. from vector env); normalize to dict for .get()
+                def _ensure_dict(v):
+                    if v is None:
+                        return {}
+                    if isinstance(v, list):
+                        return v[0] if len(v) > 0 and isinstance(v[0], dict) else {}
+                    return v if isinstance(v, dict) else {}
+
+                obs_sim = _ensure_dict(record.get("observation_sim"))
+                q_arr = np.array([float(x) for x in obs_sim.get("q", [])], dtype=np.float64)
+                dq_arr = np.array([float(x) for x in obs_sim.get("dq", [])], dtype=np.float64)
+                if len(q_arr) < robot_model.num_joints:
+                    q_arr = np.pad(q_arr, (0, max(0, robot_model.num_joints - len(q_arr))), mode="constant", constant_values=0.0)
+                if len(dq_arr) < robot_model.num_joints:
+                    dq_arr = np.pad(dq_arr, (0, max(0, robot_model.num_joints - len(dq_arr))), mode="constant", constant_values=0.0)
+                # Use floating_base_pose / floating_base_vel: from dump when present (parity with Mujoco), else from OmniGibson current obs.
+                if "floating_base_pose" in obs_sim:
+                    fb_pose = np.array([float(x) for x in obs_sim["floating_base_pose"]], dtype=np.float64)
+                    fb_pose = fb_pose if len(fb_pose) >= 7 else np.pad(fb_pose, (0, 7 - len(fb_pose)), mode="constant", constant_values=0.0)
+                elif gr00t_obs is not None and "floating_base_pose" in gr00t_obs:
+                    fb_pose = np.asarray(gr00t_obs["floating_base_pose"], dtype=np.float64).ravel()
+                    fb_pose = fb_pose if len(fb_pose) >= 7 else np.pad(fb_pose, (0, 7 - len(fb_pose)), mode="constant", constant_values=0.0)
+                else:
+                    fb_pose = np.array([0.0, 0.0, 0.8, 0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+                if "floating_base_vel" in obs_sim:
+                    fb_vel = np.array([float(x) for x in obs_sim["floating_base_vel"]], dtype=np.float64)
+                    fb_vel = fb_vel if len(fb_vel) >= 6 else np.pad(fb_vel, (0, 6 - len(fb_vel)), mode="constant", constant_values=0.0)
+                elif gr00t_obs is not None and "floating_base_vel" in gr00t_obs:
+                    fb_vel = np.asarray(gr00t_obs["floating_base_vel"], dtype=np.float64).ravel()
+                    fb_vel = fb_vel if len(fb_vel) >= 6 else np.pad(fb_vel, (0, 6 - len(fb_vel)), mode="constant", constant_values=0.0)
+                else:
+                    fb_vel = np.zeros(6, dtype=np.float64)
+                hijack_obs = {
+                    "q": q_arr[: robot_model.num_joints].astype(np.float64),
+                    "dq": dq_arr[: robot_model.num_joints].astype(np.float64),
+                    "floating_base_pose": fb_pose[:7],
+                    "floating_base_vel": fb_vel[:6],
+                }
+                wbc_goal_rec = _ensure_dict(record.get("wbc_goal"))
+                nav = np.array([float(x) for x in wbc_goal_rec.get("navigate_cmd", [0, 0, 0])], dtype=np.float64)
+                if nav.size != 3:
+                    nav = np.resize(nav, 3)
+                height = np.array([float(x) for x in wbc_goal_rec.get("base_height_command", [0.74])], dtype=np.float64)
+                height = height[:1]
+                ub_pose = np.array([float(x) for x in wbc_goal_rec.get("target_upper_body_pose", [])], dtype=np.float64)
+                # Mujoco concat_action uses robot_model.get_joint_group_indices("upper_body") = 28 (arms+hands only, no waist).
+                # Dump may have 31-D (waist 3 + arms 14 + hands 14): use indices 3:31 so we pass the same 28-D as Mujoco.
+                if upper_body_len is not None:
+                    if len(ub_pose) == 31:
+                        ub_pose = ub_pose[3:31]
+                    elif len(ub_pose) > upper_body_len:
+                        ub_pose = ub_pose[:upper_body_len]
+                    if len(ub_pose) < upper_body_len:
+                        ub_pose = np.pad(ub_pose, (0, upper_body_len - len(ub_pose)), mode="constant", constant_values=0.0)
+                hijack_goal = {
+                    "navigate_cmd": nav,
+                    "base_height_command": height,
+                    "target_upper_body_pose": ub_pose,
+                }
+                wbc_policy.set_observation(hijack_obs)
+                wbc_policy.set_goal(hijack_goal)
+                wbc_action = wbc_policy.get_action()
+                gr00t_action = {"q": np.asarray(wbc_action["q"]).astype(np.float32)}
+                last_wbc_q_for_compare = np.asarray(wbc_action["q"]).ravel().tolist()
+                last_wbc_input_for_compare = {
+                    "observation": {
+                        "q": np.asarray(hijack_obs["q"]).ravel().tolist(),
+                        "dq": np.asarray(hijack_obs["dq"]).ravel().tolist(),
+                        "floating_base_pose": np.asarray(hijack_obs["floating_base_pose"]).ravel().tolist(),
+                        "floating_base_vel": np.asarray(hijack_obs["floating_base_vel"]).ravel().tolist(),
+                    },
+                    "goal": {
+                        "navigate_cmd": np.asarray(hijack_goal["navigate_cmd"]).ravel().tolist(),
+                        "base_height_command": np.asarray(hijack_goal["base_height_command"]).ravel().tolist(),
+                        "target_upper_body_pose": np.asarray(hijack_goal["target_upper_body_pose"]).ravel().tolist(),
+                    },
+                }
+            except Exception as e:
+                print(f"WBC hijack error at step {step}: {e}", file=sys.stderr)
+                if args.verbose:
+                    import traceback
+                    traceback.print_exc()
+                last_wbc_q_for_compare = None
+                last_wbc_input_for_compare = None
+        elif wbc_policy is not None and concat_action is not None:
             try:
                 wbc_goal = concat_action(robot_model, gr00t_action)
                 # Take current timestep only: policy returns (B, T, D), WBC expects 1D per step
@@ -1350,12 +1508,13 @@ def main() -> int:
             step_dict["sent_to_simulator"] = _tensor_to_python(copy.deepcopy(og_action))
             # Format all numbers as 6-character strings
             step_dict = _format_dump_6(step_dict)
-            try:
-                dump_actions_file.write(json.dumps(step_dict) + "\n")
-                dump_actions_file.flush()
-            except Exception as e:
-                if args.verbose:
-                    print(f"Action dump write failed for step {step}: {e}", file=sys.stderr)
+            if dump_actions_file is not None:
+                try:
+                    dump_actions_file.write(json.dumps(step_dict) + "\n")
+                    dump_actions_file.flush()
+                except Exception as e:
+                    if args.verbose:
+                        print(f"Action dump write failed for step {step}: {e}", file=sys.stderr)
 
         # The adapter should return the correct format; ensure it's valid
         if args.verbose and step == 0:
@@ -1366,6 +1525,10 @@ def main() -> int:
             else:
                 print(f"OmniGibson action type: {type(og_action)}, shape: {og_action.shape if hasattr(og_action, 'shape') else 'N/A'}")
 
+        # Save action sent to env for WBC compare dump (before step)
+        if last_wbc_q_for_compare is not None and isinstance(og_action, dict):
+            last_og_action_for_compare = _tensor_to_python(copy.deepcopy(og_action))
+
         # Step environment
         result = env.step(og_action)
         if len(result) == 5:
@@ -1373,6 +1536,113 @@ def main() -> int:
             done = terminated or truncated
         else:
             og_obs, reward, done, info = result
+
+        # WBC parity: write compare line after step with all five items for Mujoco comparison.
+        if wbc_compare_file is not None and last_wbc_q_for_compare is not None:
+            try:
+                robot = env.robots[0] if env.robots else None
+                # 4. Raw output from OmniGibson env step (before adapter): OG-order joint pos/vel, base pose/vel
+                env_step_output_raw = {}
+                if robot is not None:
+                    try:
+                        jpos_raw = robot.get_joint_positions()
+                        jpos_raw = jpos_raw.detach().cpu().numpy() if hasattr(jpos_raw, "cpu") else np.asarray(jpos_raw)
+                        env_step_output_raw["joint_positions_og_order"] = np.asarray(jpos_raw).ravel().tolist()
+                    except Exception:
+                        pass
+                    try:
+                        jvel_raw = robot.get_joint_velocities()
+                        jvel_raw = jvel_raw.detach().cpu().numpy() if hasattr(jvel_raw, "cpu") else np.asarray(jvel_raw)
+                        env_step_output_raw["joint_velocities_og_order"] = np.asarray(jvel_raw).ravel().tolist()
+                    except Exception:
+                        pass
+                    try:
+                        pos, ori = robot.get_position_orientation(frame="world")
+                        pos = pos.detach().cpu().numpy() if hasattr(pos, "cpu") else np.asarray(pos)
+                        ori = ori.detach().cpu().numpy() if hasattr(ori, "cpu") else np.asarray(ori)
+                        env_step_output_raw["robot_pos"] = np.asarray(pos).ravel()[:3].tolist()
+                        env_step_output_raw["robot_quat"] = np.asarray(ori).ravel()[:4].tolist()
+                    except Exception as e:
+                        if step == 0:
+                            print(f"[WARNING] env_step_output_raw: get_position_orientation failed: {e}", file=sys.stderr)
+                    try:
+                        lin = robot.get_linear_velocity()
+                        ang = robot.get_angular_velocity()
+                        lin = lin.detach().cpu().numpy() if hasattr(lin, "cpu") else np.asarray(lin)
+                        ang = ang.detach().cpu().numpy() if hasattr(ang, "cpu") else np.asarray(ang)
+                        env_step_output_raw["robot_lin_vel"] = np.asarray(lin).ravel()[:3].tolist()
+                        env_step_output_raw["robot_ang_vel"] = np.asarray(ang).ravel()[:3].tolist()
+                    except Exception as e:
+                        if step == 0:
+                            print(f"[WARNING] env_step_output_raw: get_linear/angular_velocity failed: {e}", file=sys.stderr)
+                # Enrich og_obs for adapter
+                og_obs_after = copy.deepcopy(og_obs)
+                if robot_name_in_config in og_obs_after and robot is not None and robot_model is not None:
+                    jpos = robot.get_joint_positions()
+                    jpos = jpos.detach().cpu().numpy() if hasattr(jpos, "cpu") else np.asarray(jpos)
+                    jpos = _og_jpos_to_pinocchio_q(robot, jpos, robot_model)
+                    og_obs_after[robot_name_in_config] = dict(og_obs_after.get(robot_name_in_config) or {})
+                    og_obs_after[robot_name_in_config]["joint_qpos"] = jpos
+                    og_obs_after[robot_name_in_config].pop("proprio", None)
+                    try:
+                        jvel = robot.get_joint_velocities()
+                        jvel = jvel.detach().cpu().numpy() if hasattr(jvel, "cpu") else np.asarray(jvel)
+                        jvel = _og_jpos_to_pinocchio_q(robot, jvel, robot_model)
+                        og_obs_after[robot_name_in_config]["joint_velocities"] = jvel.astype(np.float32)
+                    except Exception:
+                        pass
+                    try:
+                        pos, ori = robot.get_position_orientation(frame="world")
+                        pos = pos.detach().cpu().numpy() if hasattr(pos, "cpu") else np.asarray(pos)
+                        ori = ori.detach().cpu().numpy() if hasattr(ori, "cpu") else np.asarray(ori)
+                        og_obs_after[robot_name_in_config]["robot_pos"] = pos[:3]
+                        og_obs_after[robot_name_in_config]["robot_quat"] = ori[:4]  # xyzw
+                    except Exception as e:
+                        if step == 0:
+                            print(f"[WARNING] og_obs_after: get_position_orientation failed: {e}", file=sys.stderr)
+                    try:
+                        lin = robot.get_linear_velocity()
+                        ang = robot.get_angular_velocity()
+                        lin = lin.detach().cpu().numpy() if hasattr(lin, "cpu") else np.asarray(lin)
+                        ang = ang.detach().cpu().numpy() if hasattr(ang, "cpu") else np.asarray(ang)
+                        og_obs_after[robot_name_in_config]["robot_lin_vel"] = lin[:3]
+                        og_obs_after[robot_name_in_config]["robot_ang_vel"] = ang[:3]
+                    except Exception as e:
+                        if step == 0:
+                            print(f"[WARNING] og_obs_after: get_linear/angular_velocity failed: {e}", file=sys.stderr)
+                gr00t_obs_after = obs_adapter.adapt(og_obs_after, verbose=False)
+                # 5. Rearranged result from adapter (Pinocchio/GR00T order)
+                adapter_output = {
+                    "q": np.asarray(gr00t_obs_after["q"]).ravel().tolist(),
+                    "dq": np.asarray(gr00t_obs_after["dq"]).ravel().tolist(),
+                    "floating_base_pose": np.asarray(gr00t_obs_after.get("floating_base_pose", np.zeros(7))).ravel().tolist(),
+                    "floating_base_vel": np.asarray(gr00t_obs_after.get("floating_base_vel", np.zeros(6))).ravel().tolist(),
+                }
+                # 3. Action sent to env: raw (controller order) + pinocchio order for comparison with Mujoco
+                action_sent = last_og_action_for_compare
+                action_sent_pinocchio = None
+                if action_sent and robot_name_in_config in action_sent and robot is not None and robot_model is not None:
+                    arr = np.array(action_sent[robot_name_in_config], dtype=np.float64)
+                    action_sent_pinocchio = _controller_order_action_to_pinocchio_q(robot, arr, robot_model).tolist()
+                compare_record = {
+                    "step": step,
+                    "wbc_input": last_wbc_input_for_compare,
+                    "wbc_output": last_wbc_q_for_compare,
+                    "action_sent_to_env": action_sent,
+                    "action_sent_to_env_pinocchio_order": action_sent_pinocchio,
+                    "env_step_output_raw": env_step_output_raw,
+                    "adapter_output": adapter_output,
+                }
+                if wbc_compare_file is not None:
+                    wbc_compare_file.write(json.dumps(compare_record) + "\n")
+                    wbc_compare_file.flush()
+            except Exception as e:
+                print(f"WBC compare write error at step {step}: {e}", file=sys.stderr)
+                import traceback
+                traceback.print_exc()
+            last_wbc_q_for_compare = None
+            last_wbc_input_for_compare = None
+            last_og_action_for_compare = None
 
         # current_q is updated at the start of the next iteration from the new og_obs
 
@@ -1392,6 +1662,9 @@ def main() -> int:
     if dump_actions_file is not None:
         dump_actions_file.close()
         print(f"Action dumps written to {dump_actions_path}")
+    if wbc_compare_file is not None:
+        wbc_compare_file.close()
+        print(f"WBC parity compare output written to {args.wbc_output_compare}")
 
     # Save videos
     if args.save_video and camera_frames and imageio:

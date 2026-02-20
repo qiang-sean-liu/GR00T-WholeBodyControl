@@ -45,7 +45,22 @@ class WholeBodyControlWrapper(gym.Wrapper):
 
         result = super().step(wbc_action)
         self.wbc_policy.set_observation(result[0])
-        return result
+        obs, reward, term, trunc, info = result
+        info = dict(info) if info else {}
+        q_full = np.asarray(wbc_action["q"]).ravel()
+        try:
+            lower_idx = self.robot_model.get_joint_group_indices("lower_body")
+            upper_idx = self.robot_model.get_joint_group_indices("upper_body")
+            info["wbc_goal"] = {k: np.asarray(v).ravel().tolist() for k, v in wbc_goal.items()}
+            info["wbc"] = {
+                "q": q_full.tolist(),
+                "q_lower_body": q_full[lower_idx].tolist(),
+                "q_upper_body": q_full[upper_idx].tolist(),
+            }
+            info["wbc_action"] = q_full.tolist()
+        except Exception:
+            pass
+        return (obs, reward, term, trunc, info)
 
     def setup_wbc_policy(self):
         robot_type, robot_model = get_robot_type_and_model(

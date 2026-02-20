@@ -263,7 +263,7 @@ class G1(LeggedManipulatorModel):
         )
         if tpp_mount_body is not None:
             _cam_config[f"{self.naming_prefix}rs_tppview"] = dict(
-                pos=[-1.131, -0.626, 1.247 - 0.793],
+                pos=[-1.131, -0.626, 1.247 - 0.85],
                 quat=[0.67953146, 0.46872971, -0.3204774, -0.46456828],
                 camera_attribs=dict(fovy="60"),
                 parent_body=f"{self.naming_prefix}pelvis",
