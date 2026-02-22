@@ -98,6 +98,54 @@ SIM2BEHAVIOR_ROOT = os.path.dirname(SCRIPT_DIR)
 G1_RESOURCES = os.path.join(SIM2BEHAVIOR_ROOT, "resources", "robots", "g1")
 CONFIG_PATH = os.path.join(SIM2BEHAVIOR_ROOT, "configs", "g1_standalone.yaml")
 
+# G1 joint position limits [min, max] in radians (mirror of isaaclab_arena_g1.g1_env.g1_constants).
+# Used to clip actions before env.step() so OmniGibson receives the same limits as Isaac Lab / Mujoco.
+G1_JOINT_LIMITS = {
+    "left_hip_pitch_joint": (-2.5307, 2.8798),
+    "left_hip_roll_joint": (-0.5236, 2.9671),
+    "left_hip_yaw_joint": (-2.7576, 2.7576),
+    "left_knee_joint": (-0.087267, 2.8798),
+    "left_ankle_pitch_joint": (-0.87267, 0.5236),
+    "left_ankle_roll_joint": (-0.2618, 0.2618),
+    "right_hip_pitch_joint": (-2.5307, 2.8798),
+    "right_hip_roll_joint": (-2.9671, 0.5236),
+    "right_hip_yaw_joint": (-2.7576, 2.7576),
+    "right_knee_joint": (-0.087267, 2.8798),
+    "right_ankle_pitch_joint": (-0.87267, 0.5236),
+    "right_ankle_roll_joint": (-0.2618, 0.2618),
+    "waist_yaw_joint": (-2.618, 2.618),
+    "waist_roll_joint": (-0.52, 0.52),
+    "waist_pitch_joint": (-0.52, 0.52),
+    "left_shoulder_pitch_joint": (-3.0892, 2.6704),
+    "left_shoulder_roll_joint": (-1.5882, 2.2515),
+    "left_shoulder_yaw_joint": (-2.618, 2.618),
+    "left_elbow_joint": (-1.0472, 2.0944),
+    "left_wrist_roll_joint": (-1.972222054, 1.972222054),
+    "left_wrist_pitch_joint": (-1.614429558, 1.614429558),
+    "left_wrist_yaw_joint": (-1.614429558, 1.614429558),
+    "right_shoulder_pitch_joint": (-3.0892, 2.6704),
+    "right_shoulder_roll_joint": (-2.2515, 1.5882),
+    "right_shoulder_yaw_joint": (-2.618, 2.618),
+    "right_elbow_joint": (-1.0472, 2.0944),
+    "right_wrist_roll_joint": (-1.972222054, 1.972222054),
+    "right_wrist_pitch_joint": (-1.614429558, 1.614429558),
+    "right_wrist_yaw_joint": (-1.614429558, 1.614429558),
+    "left_hand_thumb_0_joint": (-1.04719755, 1.04719755),
+    "left_hand_thumb_1_joint": (-0.72431163, 1.04719755),
+    "left_hand_thumb_2_joint": (0, 1.74532925),
+    "left_hand_index_0_joint": (-1.57079632, 0),
+    "left_hand_index_1_joint": (-1.74532925, 0),
+    "left_hand_middle_0_joint": (-1.57079632, 0),
+    "left_hand_middle_1_joint": (-1.74532925, 0),
+    "right_hand_thumb_0_joint": (-1.04719755, 1.04719755),
+    "right_hand_thumb_1_joint": (-0.72431163, 1.04719755),
+    "right_hand_thumb_2_joint": (0, 1.74532925),
+    "right_hand_index_0_joint": (-1.57079632, 0),
+    "right_hand_index_1_joint": (-1.74532925, 0),
+    "right_hand_middle_0_joint": (-1.57079632, 0),
+    "right_hand_middle_1_joint": (-1.74532925, 0),
+}
+
 # Default BEHAVIOR dataset root (robot assets + scene assets). OmniGibson looks for
 # omnigibson-robot-assets and behavior-1k-assets (or datasets/behavior-1k-assets) under this path.
 # Set OMNIGIBSON_DATA_PATH or use --behavior_data_path to override.
@@ -423,9 +471,10 @@ def main() -> int:
         help="Set the first 15 sent_to_simulator values (base/lower-body) to 0. Use with base controller use_delta_commands: true so base holds current pose.",
     )
     parser.add_argument(
-        "--enable_full_robot_gravity",
+        "--no_full_robot_gravity",
         action="store_true",
-        help="Re-enable gravity on all robot links (overrides OmniGibson ControllableObject default that disables gravity on non-base links). Use so the robot falls under gravity instead of floating.",
+        help="Keep OmniGibson default: gravity disabled on non-base links. "
+             "By default gravity is re-enabled on ALL links to match Mujoco.",
     )
     parser.add_argument(
         "--wbc_input_dump",
@@ -564,6 +613,17 @@ def main() -> int:
         env_config["scene"] = dict(env_config["scene"])
         env_config["scene"]["scene_model"] = args.scene_model
         print(f"Using scene_model: {args.scene_model}")
+
+    # Print loaded config diagnostics
+    _env_cfg = env_config.get("env", {})
+    _robot_cfg = (env_config.get("robots") or [{}])[0]
+    _ctrl_cfg = _robot_cfg.get("controller_config", {})
+    _base_ctrl = _ctrl_cfg.get("base", {})
+    print(f"Config: {args.config_path}")
+    print(f"  physics_freq={_env_cfg.get('physics_frequency')}, action_freq={_env_cfg.get('action_frequency')}")
+    print(f"  base isaac_kp={_base_ctrl.get('isaac_kp', 'NOT SET (OG default 1e7)')}")
+    print(f"  base isaac_kd={_base_ctrl.get('isaac_kd', 'NOT SET (OG default 1e5)')}")
+    print(f"  base motor_type={_base_ctrl.get('motor_type')}, command_input_limits={_base_ctrl.get('command_input_limits', 'NOT SET')}")
 
     # Create OmniGibson environment
     print("Creating OmniGibson environment...")
@@ -860,34 +920,123 @@ def main() -> int:
         if not unmapped and verbose:
             print("WBC–OmniGibson mapping: all controller-order joints map to Pinocchio indices.")
 
+    def _clip_action_to_g1_limits(robot, action_arr: np.ndarray, joint_names_in_order: list) -> np.ndarray:
+        """Clip action (controller order) to G1 joint limits (g1_constants) for parity with Isaac Lab / Mujoco."""
+        out = np.asarray(action_arr, dtype=np.float64).ravel().copy()
+        for i, jname in enumerate(joint_names_in_order):
+            if i >= len(out):
+                break
+            lim = G1_JOINT_LIMITS.get(jname)
+            if lim is not None:
+                out[i] = np.clip(out[i], lim[0], lim[1])
+        return out.astype(np.float32)
+    
     # Verify WBC <-> OmniGibson joint mapping once at startup
     if env.robots and robot_model is not None:
         _verify_wbc_omnigibson_mapping(env.robots[0], robot_model, args.verbose)
 
     # Always fix reset_joint_pos to correct OG articulation order.
-    # YAML reset_joint_pos is in pinocchio/sequential order (left_leg, right_leg, waist, ...)
-    # but OG articulation order is breadth-first (interleaved: left_hip_pitch, right_hip_pitch,
-    # waist_yaw, left_hip_roll, right_hip_roll, waist_roll, ...).  Using the wrong order causes
-    # the robot to start in a completely wrong pose and collapse.
-    if env.robots and robot_model is not None and hasattr(robot_model, "default_body_pose"):
+    # robot_model.default_body_pose has ZEROS for leg joints (indices 0-14) — only
+    # arm/shoulder defaults are set via G1SupplementalInfo.  The leg standing pose
+    # comes from g1_gear_wbc.yaml "default_angles".  We merge both so the full 43-D
+    # pose is correct, then convert pinocchio→OG articulation order.
+    _standing_og_tensor = None
+    if env.robots and robot_model is not None:
         robot = env.robots[0]
-        standing_pinocchio = np.asarray(robot_model.default_body_pose).ravel()
+        n_joints = getattr(robot_model, "num_joints", 43)
+        standing_pinocchio = np.zeros(n_joints, dtype=np.float64)
+
+        # Upper body from robot_model.default_body_pose (arms/shoulders)
+        if hasattr(robot_model, "default_body_pose"):
+            dbp = np.asarray(robot_model.default_body_pose).ravel()
+            standing_pinocchio[:len(dbp)] = dbp
+
+        # Lower body from WBC config default_angles (legs + waist, pinocchio indices 0-14)
+        _wbc_yaml = os.path.join(SIM2BEHAVIOR_ROOT, "..", "sim2mujoco",
+                                 "resources", "robots", "g1", "g1_gear_wbc.yaml")
+        if os.path.isfile(_wbc_yaml):
+            import yaml
+            with open(_wbc_yaml) as _f:
+                _da = yaml.safe_load(_f).get("default_angles", [])
+            if _da:
+                standing_pinocchio[:len(_da)] = _da
+                print(f"Loaded lower-body default_angles from WBC config ({len(_da)}D): {_da}")
+        else:
+            # Fallback: use G1_STANDING_JOINT_POS from unitree_g1.py via Pinocchio mapping
+            try:
+                from omnigibson.robots.unitree_g1 import G1_STANDING_JOINT_POS
+                for jname, jval in G1_STANDING_JOINT_POS.items():
+                    pidx = _pinocchio_name_to_index(robot_model, jname)
+                    if pidx is not None and 0 <= pidx < n_joints:
+                        standing_pinocchio[pidx] = jval
+                print(f"WBC config not found at {_wbc_yaml}; using G1_STANDING_JOINT_POS from unitree_g1.py")
+            except ImportError:
+                print(f"WARNING: WBC config not found at {_wbc_yaml}; using zeros for lower body")
+
         standing_og = _pinocchio_q_to_og_jpos(robot, standing_pinocchio, robot_model)
         import torch as th
-        robot.reset_joint_pos = th.tensor(standing_og, dtype=th.float)
+        _standing_og_tensor = th.tensor(standing_og, dtype=th.float)
+        robot.reset_joint_pos = _standing_og_tensor
         og_names = list(getattr(robot, "joint_names", []) or [])
         print(f"Fixed reset_joint_pos: pinocchio→OG order ({len(standing_og)}D)")
         if og_names:
             print(f"  OG articulation order (first 15): {og_names[:15]}")
             print(f"  Standing pose OG[0:15]: {[round(float(v), 4) for v in standing_og[:15]]}")
+            print(f"  Standing pose pinocchio[0:15]: {[round(float(v), 4) for v in standing_pinocchio[:15]]}")
 
-    # Re-enable gravity on all robot links so the robot falls instead of floating (ControllableObject disables it on non-base links).
-    if args.enable_full_robot_gravity and env.robots:
+        # Set drive targets + actual positions to standing, step physics to commit,
+        # then re-save the scene's initial state.  scene.restore() (called by every
+        # env.reset()) restores per-joint target_pos from the saved initial state via
+        # joint._load_state(). If that saved target_pos is zero the PD will collapse
+        # the robot during the og.sim.step() inside env.reset().  By committing the
+        # standing targets into the saved state we prevent this.
+        robot.set_joint_positions(_standing_og_tensor, drive=False)
+        robot.set_joint_positions(_standing_og_tensor, drive=True)
+        robot.set_joint_velocities(th.zeros_like(_standing_og_tensor))
+        og.sim.step()
+        for _ in range(3):
+            og.sim.render()
+        env.scene._initial_file = env.scene.save(as_dict=True)
+        print("Re-saved scene initial state with standing drive targets (prevents collapse during env.reset).")
+
+    # Raise max_effort on all robot joints.  OG's default is 100 N·m
+    # (joint_prim.py DEFAULT_MAX_EFFORT), but gravity on a 35 kg humanoid
+    # produces ~150 N·m at the hip.  Mujoco has NO such cap — the PD torque
+    # is applied without limit.  Without this the position drive cannot
+    # counteract gravity and the robot collapses regardless of kp.
+    if env.robots:
+        robot = env.robots[0]
+        _max_eff = 1e6
+        for jname, joint in robot.joints.items():
+            if hasattr(joint, "max_effort"):
+                try:
+                    joint.max_effort = _max_eff
+                except Exception:
+                    pass
+        print(f"Set max_effort={_max_eff:.0e} on all joints (removes OG 100 N·m cap).")
+
+    # Re-enable gravity on all robot links so dynamics match Mujoco (which has
+    # gravity on every link).  OG's ControllableObject._post_load() disables
+    # gravity on non-base links by default; without this the robot floats and
+    # PD drives have nothing to fight, producing wildly different trajectories.
+    if not args.no_full_robot_gravity and env.robots:
         for robot in env.robots:
             if hasattr(robot, "enable_gravity"):
                 robot.enable_gravity()
-        if args.verbose:
-            print("enable_full_robot_gravity: enabled gravity on all robot links.")
+        og.sim.step()
+        for _ in range(3):
+            og.sim.render()
+        # Re-teleport to standing after gravity step — the PD at zero error
+        # produces ~0 force while gravity pulls ~150 N-m, so the robot drifts.
+        _grob = env.robots[0]
+        _grob.set_joint_positions(_standing_og_tensor, drive=False)
+        _grob.set_joint_positions(_standing_og_tensor, drive=True)
+        _grob.set_joint_velocities(th.zeros_like(_standing_og_tensor))
+        og.sim.step()
+        for _ in range(3):
+            og.sim.render()
+        env.scene._initial_file = env.scene.save(as_dict=True)
+        print("Gravity re-enabled (matching Mujoco). Standing re-teleported, scene re-saved.")
 
     # WBC (Whole-Body Control) for sim2behavior: same as RoboCasa locomanip pipeline
     wbc_policy = None
@@ -1070,6 +1219,54 @@ def main() -> int:
         print("Topdown camera will follow robot (height 1m, offset 1m in x/y, oriented at robot center)")
     print(f"Starting simulation loop (max {args.max_steps} steps)...")
     reset_out = env.reset()
+
+    # Safety net: even with the monkey-patched robot.reset() (which now sets drive
+    # targets), verify the robot is at the standing pose.  If scene.restore() or
+    # another code path bypassed our patch, re-teleport + re-set targets here.
+    if _standing_og_tensor is not None and env.robots:
+        import torch as th
+        _robot = env.robots[0]
+        _jpos = _robot.get_joint_positions()
+        _jpos = _jpos.detach().cpu() if hasattr(_jpos, "cpu") else th.tensor(_jpos)
+        _err = float((_jpos - _standing_og_tensor).abs().max())
+        if _err > 0.05:
+            print(f"Post-reset: robot NOT at standing (max joint err={_err:.4f}), re-teleporting...")
+            _robot.set_joint_positions(_standing_og_tensor, drive=False)
+            _robot.set_joint_positions(_standing_og_tensor, drive=True)
+            _robot.set_joint_velocities(th.zeros_like(_standing_og_tensor))
+            og.sim.step()
+            for _ in range(3):
+                og.sim.render()
+            reset_out = env.get_obs()
+        else:
+            print(f"Post-reset: robot at standing pose (max joint err={_err:.4f}), no re-teleport needed.")
+
+    # Re-apply max_effort AFTER env.reset() (scene.restore() may overwrite it)
+    # and print PhysX drive diagnostics for key joints so we can verify what
+    # PhysX is actually using.
+    if env.robots:
+        _diag_robot = env.robots[0]
+        _max_eff = 1e6
+        _diag_joints = []
+        for _jn, _jt in _diag_robot.joints.items():
+            if not hasattr(_jt, "max_effort"):
+                continue
+            _old_eff = float(_jt.max_effort)
+            try:
+                _jt.max_effort = _max_eff
+            except Exception:
+                pass
+            _kp = float(_jt.stiffness) if hasattr(_jt, "stiffness") else None
+            _kd = float(_jt.damping) if hasattr(_jt, "damping") else None
+            _diag_joints.append((_jn, _kp, _kd, _old_eff))
+        print(f"Post-reset: re-applied max_effort={_max_eff:.0e} on {len(_diag_joints)} joints.")
+        _leg_names = ["left_hip_pitch", "left_knee", "left_ankle_pitch",
+                      "right_hip_pitch", "right_knee", "right_ankle_pitch",
+                      "waist_yaw"]
+        for _jn, _kp, _kd, _old_eff in _diag_joints:
+            if any(_ln in _jn for _ln in _leg_names):
+                print(f"  {_jn}: kp={_kp}, kd={_kd}, max_effort_was={_old_eff:.1f}")
+
     og_obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
     current_q = None  # Track current joint state for action adapter
 
@@ -1448,6 +1645,15 @@ def main() -> int:
             if len(arr) >= 15:
                 arr[0:15] = 0.0
                 og_action[robot_name_in_config] = arr
+
+        # Clip action to G1 joint limits (g1_constants) so OmniGibson receives same bounds as Isaac Lab / Mujoco
+        if isinstance(og_action, dict) and robot_name_in_config in og_action and env.robots:
+            robot = env.robots[0]
+            names_in_order = _get_controller_order_joint_names(robot)
+            if names_in_order:
+                og_action[robot_name_in_config] = _clip_action_to_g1_limits(
+                    robot, og_action[robot_name_in_config], names_in_order
+                )
 
         # Write per-step action dump to single text file (JSON Lines: one JSON object per step)
         if dump_actions_file is not None and gr00t_action_for_dump is not None:

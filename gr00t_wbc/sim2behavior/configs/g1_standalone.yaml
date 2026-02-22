@@ -6,9 +6,9 @@
 #   focal_length tuned to give a similar FOV (wider than default 17 mm).
 
 env:
-  action_frequency: 30  # Hz
-  rendering_frequency: 30  # Hz
-  physics_frequency: 120  # Hz
+  action_frequency: 50      # Match Mujoco: control_decimation=4 at 200Hz -> 50Hz control
+  rendering_frequency: 50
+  physics_frequency: 200    # Match Mujoco: simulation_dt=0.005 -> 200Hz
   # Optional: external cameras (scene-level, not on robot). Observations appear in obs["external"][sensor_name].
   external_sensors:
     - sensor_type: VisionSensor
@@ -20,7 +20,7 @@ env:
         image_width: 640    # Match G1 eval: RS_VIEW_CAMERA_WIDTH
         # Wider FOV so the robot fits in frame (~60° like RoboCasa agentview).
         focal_length: 12.0
-      position: [0.0, 0.0, 3.5]   # above robot (robot at z≈0.8); raise to 3.5 if needed to see full body
+      position: [0.0, 0.0, 3.5]   # above robot (robot at z~0.8); raise to 3.5 if needed to see full body
       # identity = look along -Z. If view shows sky, use script flag: --topdown_orientation flip_x
       orientation: [0.0, 0.0, 0.0, 1.0]
       pose_frame: scene
@@ -51,33 +51,59 @@ robots:
     obs_modalities: ["proprio", "rgb"]
     # WBC outputs joint positions; all controllers must use JointController with position and no delta.
     # Base (legs + waist), arms, and hands (grippers) are all joint-space for consistency with RoboCasa.
+    # isaac_kp / isaac_kd: PhysX position-drive stiffness/damping matching Mujoco PD gains.
+    # Mujoco source: g1_gear_wbc.yaml  kps/kds (lower body); arm kp=100 kd=0.5 (upper body).
     controller_config:
       base:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false   # base receives absolute joint targets from WBC lower-body (15d)
+        command_input_limits: null  # WBC sends absolute radians, not normalized [-1,1]
+        command_output_limits: null
+        isaac_kp: [150.0, 150.0, 150.0, 200.0, 40.0, 40.0,
+                   150.0, 150.0, 150.0, 200.0, 40.0, 40.0,
+                   250.0, 250.0, 250.0]
+        isaac_kd: [2.0, 2.0, 2.0, 4.0, 2.0, 2.0,
+                   2.0, 2.0, 2.0, 4.0, 2.0, 2.0,
+                   5.0, 5.0, 5.0]
       arm_left:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false
+        command_input_limits: null
+        command_output_limits: null
+        isaac_kp: 100.0
+        isaac_kd: 0.5
       arm_right:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false
+        command_input_limits: null
+        command_output_limits: null
+        isaac_kp: 100.0
+        isaac_kd: 0.5
       gripper_left:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false
+        command_input_limits: null
+        command_output_limits: null
+        isaac_kp: 100.0
+        isaac_kd: 0.5
       gripper_right:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false
+        command_input_limits: null
+        command_output_limits: null
+        isaac_kp: 100.0
+        isaac_kd: 0.5
     sensor_config:
       VisionSensor:
         sensor_kwargs:
           image_height: 480   # Match MuJoCo RS_VIEW_CAMERA_HEIGHT
           image_width: 640    # Match MuJoCo RS_VIEW_CAMERA_WIDTH
-          focal_length: 5.41  # Match MuJoCo robot0_oak_egoview fovy 79.5° (vertical FOV)
+          focal_length: 5.41  # Match MuJoCo robot0_oak_egoview fovy 79.5 deg (vertical FOV)
 
 # Optional: minimal task config (not needed for standalone robot testing)
 # task:

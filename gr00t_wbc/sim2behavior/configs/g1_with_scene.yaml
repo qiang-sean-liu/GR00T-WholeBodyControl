@@ -72,6 +72,8 @@ robots:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false   # base receives absolute joint targets from WBC lower-body (15d)
+        command_input_limits: null  # WBC sends absolute radians, not normalized [-1,1]
+        command_output_limits: null
         isaac_kp: [150.0, 150.0, 150.0, 200.0, 40.0, 40.0,
                    150.0, 150.0, 150.0, 200.0, 40.0, 40.0,
                    250.0, 250.0, 250.0]
@@ -82,26 +84,35 @@ robots:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false
-        isaac_kp: 50.0
-        isaac_kd: 14.14
+        command_input_limits: null
+        command_output_limits: null
+        # 7-D: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw
+        isaac_kp: [100.0, 100.0, 40.0, 40.0, 20.0, 20.0, 20.0]
+        isaac_kd: [5.0, 5.0, 2.0, 2.0, 2.0, 2.0, 2.0]
       arm_right:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false
-        isaac_kp: 50.0
-        isaac_kd: 14.14
+        command_input_limits: null
+        command_output_limits: null
+        isaac_kp: [100.0, 100.0, 40.0, 40.0, 20.0, 20.0, 20.0]
+        isaac_kd: [5.0, 5.0, 2.0, 2.0, 2.0, 2.0, 2.0]
       gripper_left:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false
-        isaac_kp: 50.0
-        isaac_kd: 14.14
+        command_input_limits: null
+        command_output_limits: null
+        isaac_kp: 4.0
+        isaac_kd: 0.5
       gripper_right:
         name: "JointController"
         motor_type: "position"
         use_delta_commands: false
-        isaac_kp: 50.0
-        isaac_kd: 14.14
+        command_input_limits: null
+        command_output_limits: null
+        isaac_kp: 4.0
+        isaac_kd: 0.5
     sensor_config:
       VisionSensor:
         sensor_kwargs:
