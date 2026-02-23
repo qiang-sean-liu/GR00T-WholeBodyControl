@@ -584,6 +584,10 @@ def main() -> int:
             OmniGibsonToGR00TObservationAdapter,
             GR00TToOmniGibsonActionAdapter,
         )
+        try:
+            from g1_standing_pose_isaaclab import build_standing_pinocchio_from_names
+        except ImportError:
+            build_standing_pinocchio_from_names = None
     except ImportError as e:
         error_msg = str(e)
         print(f"GR00T-WholeBodyControl adapters not available: {error_msg}", file=sys.stderr)
@@ -936,42 +940,40 @@ def main() -> int:
         _verify_wbc_omnigibson_mapping(env.robots[0], robot_model, args.verbose)
 
     # Always fix reset_joint_pos to correct OG articulation order.
-    # robot_model.default_body_pose has ZEROS for leg joints (indices 0-14) — only
-    # arm/shoulder defaults are set via G1SupplementalInfo.  The leg standing pose
-    # comes from g1_gear_wbc.yaml "default_angles".  We merge both so the full 43-D
-    # pose is correct, then convert pinocchio→OG articulation order.
+    # Prefer Isaac Lab Arena G1SceneCfg.init_state.joint_pos (by name) so the robot
+    # starts in the same stable standing pose as in isaaclab_arena; prevents collapse.
     _standing_og_tensor = None
     if env.robots and robot_model is not None:
         robot = env.robots[0]
         n_joints = getattr(robot_model, "num_joints", 43)
-        standing_pinocchio = np.zeros(n_joints, dtype=np.float64)
-
-        # Upper body from robot_model.default_body_pose (arms/shoulders)
-        if hasattr(robot_model, "default_body_pose"):
-            dbp = np.asarray(robot_model.default_body_pose).ravel()
-            standing_pinocchio[:len(dbp)] = dbp
-
-        # Lower body from WBC config default_angles (legs + waist, pinocchio indices 0-14)
-        _wbc_yaml = os.path.join(SIM2BEHAVIOR_ROOT, "..", "sim2mujoco",
-                                 "resources", "robots", "g1", "g1_gear_wbc.yaml")
-        if os.path.isfile(_wbc_yaml):
-            import yaml
-            with open(_wbc_yaml) as _f:
-                _da = yaml.safe_load(_f).get("default_angles", [])
-            if _da:
-                standing_pinocchio[:len(_da)] = _da
-                print(f"Loaded lower-body default_angles from WBC config ({len(_da)}D): {_da}")
+        if build_standing_pinocchio_from_names is not None:
+            standing_pinocchio = build_standing_pinocchio_from_names(robot_model, n_joints)
+            print(f"Standing pose from Isaac Lab Arena G1 init_state (by name), {n_joints}D")
         else:
-            # Fallback: use G1_STANDING_JOINT_POS from unitree_g1.py via Pinocchio mapping
-            try:
-                from omnigibson.robots.unitree_g1 import G1_STANDING_JOINT_POS
-                for jname, jval in G1_STANDING_JOINT_POS.items():
-                    pidx = _pinocchio_name_to_index(robot_model, jname)
-                    if pidx is not None and 0 <= pidx < n_joints:
-                        standing_pinocchio[pidx] = jval
-                print(f"WBC config not found at {_wbc_yaml}; using G1_STANDING_JOINT_POS from unitree_g1.py")
-            except ImportError:
-                print(f"WARNING: WBC config not found at {_wbc_yaml}; using zeros for lower body")
+            # Fallback: set legs+waist first (WBC default_angles or G1_STANDING_JOINT_POS), then upper from default_body_pose
+            standing_pinocchio = np.zeros(n_joints, dtype=np.float64)
+            _wbc_yaml = os.path.join(SIM2BEHAVIOR_ROOT, "..", "sim2mujoco", "resources", "robots", "g1", "g1_gear_wbc.yaml")
+            if os.path.isfile(_wbc_yaml):
+                import yaml
+                with open(_wbc_yaml) as _f:
+                    _da = yaml.safe_load(_f).get("default_angles", [])
+                if _da:
+                    standing_pinocchio[: len(_da)] = _da
+            else:
+                try:
+                    from omnigibson.robots.unitree_g1 import G1_STANDING_JOINT_POS
+                    for jname, jval in G1_STANDING_JOINT_POS.items():
+                        pidx = _pinocchio_name_to_index(robot_model, jname)
+                        if pidx is not None and 0 <= pidx < n_joints:
+                            standing_pinocchio[pidx] = jval
+                except Exception:
+                    pass
+            if hasattr(robot_model, "default_body_pose"):
+                dbp = np.asarray(robot_model.default_body_pose).ravel()
+                ub_len = min(len(dbp) - 15, n_joints - 15)
+                if ub_len > 0:
+                    standing_pinocchio[15 : 15 + ub_len] = dbp[15 : 15 + ub_len]
+            print(f"Standing pose from WBC/default_body_pose fallback, {n_joints}D")
 
         standing_og = _pinocchio_q_to_og_jpos(robot, standing_pinocchio, robot_model)
         import torch as th
