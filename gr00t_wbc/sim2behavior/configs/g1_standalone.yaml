@@ -51,7 +51,7 @@ robots:
     obs_modalities: ["proprio", "rgb"]
     # WBC outputs joint positions; all controllers must use JointController with position and no delta.
     # Base (legs + waist), arms, and hands (grippers) are all joint-space for consistency with RoboCasa.
-    # isaac_kp / isaac_kd: PhysX position-drive stiffness/damping matching Mujoco PD gains.
+    # isaac_kp / isaac_kd: PhysX position-drive from Isaac Lab G1SceneCfg; knee kp=300 for stand/walk.
     # Mujoco source: g1_gear_wbc.yaml  kps/kds (lower body); arm kp=100 kd=0.5 (upper body).
     controller_config:
       base:
@@ -60,8 +60,8 @@ robots:
         use_delta_commands: false   # base receives absolute joint targets from WBC lower-body (15d)
         command_input_limits: null  # WBC sends absolute radians, not normalized [-1,1]
         command_output_limits: null
-        isaac_kp: [150.0, 150.0, 150.0, 200.0, 40.0, 40.0,
-                   150.0, 150.0, 150.0, 200.0, 40.0, 40.0,
+        isaac_kp: [150.0, 150.0, 150.0, 300.0, 40.0, 40.0,
+                   150.0, 150.0, 150.0, 300.0, 40.0, 40.0,
                    250.0, 250.0, 250.0]
         isaac_kd: [2.0, 2.0, 2.0, 4.0, 2.0, 2.0,
                    2.0, 2.0, 2.0, 4.0, 2.0, 2.0,

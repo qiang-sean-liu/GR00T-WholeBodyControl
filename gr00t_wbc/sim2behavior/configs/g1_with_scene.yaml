@@ -1,5 +1,7 @@
 # OmniGibson config for Unitree G1 with a scene that has geometry (floor, walls).
-# Use this for a visible background that contrasts with the robot (instead of empty "Scene").
+# Physical embodiment: g1_29dof_with_hand_rev_1_0.usd when present in omnigibson-robot-assets
+# (same as Isaac Lab Arena); otherwise unitree_g1.usda. Joint conversions in the run script
+# are by name, so either USD works.
 #
 # How to use: pass this config when running the GR00T client or standalone script, e.g.:
 #   --config_path configs/g1_with_scene.yaml
@@ -51,6 +53,7 @@ scene:
   # waypoint_resolution: 0.2
 
 robots:
+  # UnitreeG1 loads g1_29dof_with_hand_rev_1_0.usd when available (Isaac Lab parity).
   - type: "UnitreeG1"
     name: "unitree_g1"
     position: [0.0, 0.0, 0.85]
@@ -65,8 +68,8 @@ robots:
     # (left_leg, right_leg, waist).  A wrong order causes the robot to collapse.
     # WBC outputs joint positions; all controllers must use JointController with position and no delta.
     # Base (legs + waist), arms, and hands (grippers) are all joint-space for consistency with RoboCasa.
-    # isaac_kp / isaac_kd: PhysX position-drive stiffness/damping matching Mujoco PD gains.
-    # Mujoco source: g1_gear_wbc.yaml  kps/kds (lower body); robosuite default kp=50 (upper body).
+    # isaac_kp / isaac_kd: PhysX position-drive stiffness/damping from Isaac Lab G1SceneCfg
+    # (isaaclab_arena/embodiments/g1/g1.py): legs 150/2, knee 300/4, feet 40/2, waist 250/5.
     controller_config:
       base:
         name: "JointController"
@@ -74,8 +77,8 @@ robots:
         use_delta_commands: false   # base receives absolute joint targets from WBC lower-body (15d)
         command_input_limits: null  # WBC sends absolute radians, not normalized [-1,1]
         command_output_limits: null
-        isaac_kp: [150.0, 150.0, 150.0, 200.0, 40.0, 40.0,
-                   150.0, 150.0, 150.0, 200.0, 40.0, 40.0,
+        isaac_kp: [150.0, 150.0, 150.0, 300.0, 40.0, 40.0,
+                   150.0, 150.0, 150.0, 300.0, 40.0, 40.0,
                    250.0, 250.0, 250.0]
         isaac_kd: [2.0, 2.0, 2.0, 4.0, 2.0, 2.0,
                    2.0, 2.0, 2.0, 4.0, 2.0, 2.0,

@@ -1,6 +1,10 @@
 """
 Observation and action adapters for running GR00T policy with OmniGibson G1 robot.
 
+Physical embodiment: g1_29dof_with_hand_rev_1_0.usd (same as Isaac Lab Arena) when available;
+otherwise unitree_g1.usda. All conversions between simulator and GR00T are by joint *name*,
+so articulation order from the loaded USD does not matter.
+
 Maps between:
 - OmniGibson observation format (obs["unitree_g1"], obs["external"], etc.)
 - GR00T policy observation format (q, dq, camera images, state.*, annotation.human.task_description)
@@ -229,8 +233,14 @@ class OmniGibsonToGR00TObservationAdapter:
         if base_ang_vel is None:
             base_ang_vel = np.array([0.0, 0.0, 0.0])
 
-        # Convert quat from [x,y,z,w] to [x,y,z,w] (already correct) and build 7D pose
-        floating_base_pose = np.concatenate([base_pos, base_quat])  # (7,)
+        # WBC (gear_wbc_utils.get_gravity_orientation) expects quat as (w,x,y,z); OmniGibson returns (x,y,z,w).
+        # Convert so floating_base_pose[3:7] is (w,x,y,z) for correct gravity direction and parity with isaaclab_arena_g1.
+        base_quat = np.asarray(base_quat).ravel()[:4]
+        if len(base_quat) == 4:
+            quat_wxyz = np.array([float(base_quat[3]), float(base_quat[0]), float(base_quat[1]), float(base_quat[2])], dtype=np.float32)
+        else:
+            quat_wxyz = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        floating_base_pose = np.concatenate([np.asarray(base_pos).ravel()[:3], quat_wxyz]).astype(np.float32)  # (7,)
         floating_base_vel = np.concatenate([base_vel, base_ang_vel])  # (6,)
         floating_base_acc = np.zeros(6)  # not typically available
 
@@ -500,8 +510,10 @@ class GR00TToOmniGibsonActionAdapter:
 
         Returns:
             OmniGibson action dict. Format depends on action_space:
-            - If Dict: {robot_name: {"qpos": np.ndarray, ...}}
-            - If Box: np.ndarray (flat joint positions)
+            - If Dict: {robot_name: np.ndarray} where the array is joint positions in
+              **og_joint_names order** (same as robot.joint_names when set by run script).
+              Length is og_action_dim (may be less than robot_model.num_joints if OG has fewer controllable joints).
+            - If Box: same array as above (flat joint positions).
         """
         # Handle different action formats from policy wrapper
         if "q" in gr00t_action:

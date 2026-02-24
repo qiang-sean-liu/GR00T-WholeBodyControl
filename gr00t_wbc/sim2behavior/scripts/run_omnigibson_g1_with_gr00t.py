@@ -72,7 +72,17 @@ os.environ.setdefault("ISAAC_SIM_HEADLESS", "1")
 os.environ.setdefault("DISPLAY", "")
 os.environ.setdefault("RTX_DRIVER_VERIFICATION", "0")
 # Isaac Sim arguments (these need to be in sys.argv for OmniGibson but not for argparse)
-_isaac_args = []
+# Optional: enable motion_generation to avoid OGN registration error. Tried both IDs; if the error
+# still appears, Kit may start before this script or the extension may be missing in your build.
+# You can ignore it: "OGN node registration... motion_generation" does not affect simulation or WBC.
+_isaac_args = [
+    "--enable",
+    "isaacsim.robot_motion.motion_generation",
+    "--enable",
+    "omni.isaac.motion_generation",
+]
+for _arg in reversed(_isaac_args):
+    sys.argv.insert(1, _arg)
 # _isaac_args = [
 #     "--/rtx/verifyDriverVersion/enabled=false",
 #     "--/rtx/enabled=false",
@@ -712,6 +722,23 @@ def main() -> int:
     action_adapter.og_action_dim = og_action_dim
     action_adapter.og_joint_names = og_joint_names
 
+    # Load WBC joint order (same as isaaclab_arena_g1) for identical observation and action flow
+    wbc_joints_order = None
+    _wbc_yaml_path = os.path.join(SIM2BEHAVIOR_ROOT, "configs", "loco_manip_g1_joints_order_43dof.yaml")
+    if os.path.isfile(_wbc_yaml_path):
+        try:
+            import yaml
+            with open(_wbc_yaml_path) as _f:
+                wbc_joints_order = yaml.safe_load(_f)
+            if wbc_joints_order and args.verbose:
+                print(f"Using WBC joint order from {_wbc_yaml_path} ({len(wbc_joints_order)} joints, same as isaaclab_arena_g1)")
+        except Exception as e:
+            if args.verbose:
+                print(f"Could not load WBC joint order from {_wbc_yaml_path}: {e}", file=sys.stderr)
+    else:
+        if args.verbose:
+            print(f"WBC joint order YAML not found at {_wbc_yaml_path}, using robot_model-based conversion")
+
     def _to_robot_action_dim(robot, action: np.ndarray) -> np.ndarray:
         """Ensure action length matches robot.action_dim (trim or zero-pad)."""
         action = np.asarray(action, dtype=np.float32).ravel()
@@ -725,7 +752,8 @@ def main() -> int:
         return action
 
     def _get_controller_order_joint_names(robot):
-        """Get joint names in the order expected by env.step(action) (controller order)."""
+        """Get joint names in the order expected by env.step(action) (controller order).
+        Works with g1_29dof_with_hand_rev_1_0.usd or unitree_g1.usda; order comes from the loaded USD."""
         if not hasattr(robot, "controller_order") or not hasattr(robot, "_controllers"):
             return None
         # Joint names in articulation/dof order (index i = dof index). UnitreeG1 uses robot.joints, not joint_names/controllable_joints.
@@ -748,6 +776,72 @@ def main() -> int:
                 if 0 <= idx < len(og_names):
                     names_in_controller_order.append(og_names[idx])
         return names_in_controller_order if names_in_controller_order else None
+
+    def convert_sim_joint_to_wbc_joint(sim_joint_data, sim_joint_names, wbc_joints_order):
+        """Convert sim joint data to WBC joint order (same as isaaclab_arena_g1 run_policy.py).
+        sim_joint_data: (num_envs, num_joints) or (num_joints,); sim_joint_names: list in sim order.
+        Returns array in WBC order (num_envs, num_joints) or (num_joints,)."""
+        sim_joint_data = np.asarray(sim_joint_data, dtype=np.float64)
+        if sim_joint_data.ndim == 1:
+            sim_joint_data = sim_joint_data.reshape(1, -1)
+            squeeze = True
+        else:
+            squeeze = False
+        num_envs, _ = sim_joint_data.shape
+        num_joints = len(wbc_joints_order)
+        wbc_joint_data = np.zeros((num_envs, num_joints), dtype=np.float64)
+        for sim_joint_name in sim_joint_names:
+            if sim_joint_name not in wbc_joints_order:
+                continue
+            sim_idx = sim_joint_names.index(sim_joint_name)
+            wbc_idx = wbc_joints_order[sim_joint_name]
+            wbc_joint_data[:, wbc_idx] = sim_joint_data[:, sim_idx]
+        if squeeze:
+            wbc_joint_data = wbc_joint_data[0]
+        return wbc_joint_data
+
+    def wbc_to_sim_order(q_wbc, sim_joint_names, wbc_joints_order):
+        """Convert q from WBC order to sim (OG articulation) order (same as postprocess_actions in Arena)."""
+        q_wbc = np.asarray(q_wbc, dtype=np.float64).ravel()
+        q_sim = np.zeros(len(sim_joint_names), dtype=np.float64)
+        for wbc_joint_name, wbc_idx in wbc_joints_order.items():
+            if wbc_joint_name not in sim_joint_names:
+                continue
+            sim_idx = sim_joint_names.index(wbc_joint_name)
+            if 0 <= wbc_idx < len(q_wbc):
+                q_sim[sim_idx] = q_wbc[wbc_idx]
+        return q_sim
+
+    def wbc_order_to_robot_model_order(q_wbc, wbc_joints_order, robot_model):
+        """Convert q from WBC (YAML) order to robot_model (Pinocchio) order for adapter input."""
+        q_wbc = np.asarray(q_wbc, dtype=np.float64).ravel()
+        n = getattr(robot_model, "num_joints", None) or getattr(robot_model, "num_dofs", len(q_wbc))
+        q_rm = np.zeros(int(n), dtype=np.float64)
+        for name in getattr(robot_model, "joint_names", []):
+            if name not in wbc_joints_order:
+                continue
+            try:
+                pidx = robot_model.dof_index(name)
+            except (ValueError, KeyError):
+                continue
+            wbc_idx = wbc_joints_order[name]
+            if 0 <= pidx < n and 0 <= wbc_idx < len(q_wbc):
+                q_rm[pidx] = q_wbc[wbc_idx]
+        return q_rm.astype(np.float32)
+
+    def robot_model_order_to_wbc_order(q_robot_model, robot_model, wbc_joints_order):
+        """Convert q from robot_model order to WBC (YAML) order for action path."""
+        q_rm = np.asarray(q_robot_model, dtype=np.float64).ravel()
+        num_joints = len(wbc_joints_order)
+        q_wbc = np.zeros(num_joints, dtype=np.float64)
+        for wbc_joint_name, wbc_idx in wbc_joints_order.items():
+            try:
+                pidx = robot_model.dof_index(wbc_joint_name)
+            except (ValueError, KeyError):
+                continue
+            if 0 <= wbc_idx < num_joints and 0 <= pidx < len(q_rm):
+                q_wbc[wbc_idx] = q_rm[pidx]
+        return q_wbc
 
     def _pinocchio_name_to_index(robot_model, og_name: str):
         """Resolve OmniGibson joint name to Pinocchio q index (exact or fuzzy match)."""
@@ -841,6 +935,17 @@ def main() -> int:
             else:
                 out.append(0.0)
         return _to_robot_action_dim(robot, np.array(out, dtype=np.float32))
+
+    def _robot_model_q_to_controller_order_action(robot, q_robot_model: np.ndarray, robot_model) -> np.ndarray:
+        """Convert q (robot_model order) to controller order. Uses Arena flow (WBC->sim->controller) when wbc_joints_order is loaded."""
+        q = np.asarray(q_robot_model, dtype=np.float64).ravel()
+        if wbc_joints_order is not None:
+            sim_joint_names = getattr(robot, "joint_names", None) or (list(robot.joints.keys()) if hasattr(robot, "joints") and robot.joints else None)
+            if sim_joint_names is not None:
+                q_wbc = robot_model_order_to_wbc_order(q, robot_model, wbc_joints_order)
+                q_sim = wbc_to_sim_order(q_wbc, sim_joint_names, wbc_joints_order)
+                return _to_robot_action_dim(robot, _joint_positions_to_controller_order_action(robot, q_sim))
+        return _pinocchio_q_to_controller_order_action(robot, q, robot_model)
 
     def _controller_order_action_to_pinocchio_q(robot, action_controller: np.ndarray, robot_model) -> np.ndarray:
         """
@@ -1017,6 +1122,40 @@ def main() -> int:
                     pass
         print(f"Set max_effort={_max_eff:.0e} on all joints (removes OG 100 N·m cap).")
 
+    # Solver, damping, and depenetration: match Isaac Lab G1SceneCfg (isaaclab_arena/embodiments/g1/g1.py)
+    # rigid_props: solver_position_iteration_count=4, solver_velocity_iteration_count=0,
+    #             linear_damping=0.0, angular_damping=0.0, max_depenetration_velocity=1.0
+    if env.robots:
+        robot = env.robots[0]
+        if hasattr(robot, "solver_position_iteration_count"):
+            robot.solver_position_iteration_count = 4
+        if hasattr(robot, "solver_velocity_iteration_count"):
+            robot.solver_velocity_iteration_count = 0
+        print("Set robot solver: position_iterations=4, velocity_iterations=0 (Isaac Lab G1 parity).")
+        linear_damping_val = 0.0
+        angular_damping_val = 0.0
+        max_depenetration_val = 1.0
+        for link_name, link in getattr(robot, "_links", {}).items():
+            try:
+                if hasattr(link, "set_attribute"):
+                    try:
+                        link.set_attribute("physics:linearDamping", linear_damping_val)
+                    except Exception:
+                        pass
+                    try:
+                        link.set_attribute("physics:angularDamping", angular_damping_val)
+                    except Exception:
+                        pass
+                    for attr in ("physxRigidBody:maxDepenetrationVelocity", "physics:maxDepenetrationVelocity"):
+                        try:
+                            link.set_attribute(attr, max_depenetration_val)
+                            break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        print("Set robot link damping (linear=0, angular=0) and max_depenetration_velocity=1.0 where supported (Isaac Lab G1 parity).")
+
     # Re-enable gravity on all robot links so dynamics match Mujoco (which has
     # gravity on every link).  OG's ControllableObject._post_load() disables
     # gravity on non-base links by default; without this the robot floats and
@@ -1051,6 +1190,7 @@ def main() -> int:
             concat_action = _concat_action
             config = BaseConfig(wbc_version="gear_wbc", enable_waist=True)
             wbc_config = config.load_wbc_yaml()
+            wbc_config["model_base_dir"] = G1_RESOURCES  # Use sim2behavior ONNX from resources/robots/g1/policy
             wbc_config["upper_body_policy_type"] = "identity"
             robot_type = "g1"
             wbc_policy = get_wbc_policy(robot_type, robot_model, wbc_config)
@@ -1335,8 +1475,14 @@ def main() -> int:
             if step == 0 and (args.hold_initial_pose or args.no_op_first_step):
                 jpos_og_raw = np.asarray(jpos).ravel().copy()
             # Convert to Pinocchio order so policy/WBC see correct joint-to-index mapping (body_indices, etc.)
+            # Use same flow as isaaclab_arena_g1: sim -> WBC order (convert_sim_joint_to_wbc_joint) then WBC -> robot_model order for adapter
             if robot_model is not None:
-                jpos = _og_jpos_to_pinocchio_q(robot, jpos, robot_model)
+                sim_joint_names = getattr(robot, "joint_names", None) or (list(robot.joints.keys()) if hasattr(robot, "joints") and robot.joints else None)
+                if wbc_joints_order is not None and sim_joint_names is not None:
+                    q_wbc = convert_sim_joint_to_wbc_joint(jpos, sim_joint_names, wbc_joints_order)
+                    jpos = wbc_order_to_robot_model_order(q_wbc, wbc_joints_order, robot_model)
+                else:
+                    jpos = _og_jpos_to_pinocchio_q(robot, jpos, robot_model)
             if isinstance(og_obs[robot_name_in_config], dict):
                 og_obs[robot_name_in_config]["joint_qpos"] = jpos
                 # Remove raw proprio tensor so the adapter uses our Pinocchio-
@@ -1351,7 +1497,12 @@ def main() -> int:
                     else:
                         jvel = np.asarray(jvel)
                     if robot_model is not None:
-                        jvel = _og_jpos_to_pinocchio_q(robot, jvel, robot_model)
+                        sim_joint_names = getattr(robot, "joint_names", None) or (list(robot.joints.keys()) if hasattr(robot, "joints") and robot.joints else None)
+                        if wbc_joints_order is not None and sim_joint_names is not None:
+                            dq_wbc = convert_sim_joint_to_wbc_joint(jvel, sim_joint_names, wbc_joints_order)
+                            jvel = wbc_order_to_robot_model_order(dq_wbc, wbc_joints_order, robot_model)
+                        else:
+                            jvel = _og_jpos_to_pinocchio_q(robot, jvel, robot_model)
                     og_obs[robot_name_in_config]["joint_velocities"] = jvel.astype(np.float32)
                 except Exception:
                     pass
@@ -1365,10 +1516,15 @@ def main() -> int:
                 except Exception as e:
                     if step == 0:
                         print(f"[WARNING] get_position_orientation failed at step {step}: {e}", file=sys.stderr)
-                # Base velocity (separate try/except so position is not lost on velocity failure)
+                # Base velocity (separate try/except so position is not lost on velocity failure).
+                # When WBC is used, use body-frame (relative) velocities to match isaaclab_arena_g1 and WBC training.
                 try:
-                    lin = robot.get_linear_velocity()
-                    ang = robot.get_angular_velocity()
+                    if wbc_policy is not None and hasattr(robot, "get_relative_linear_velocity") and hasattr(robot, "get_relative_angular_velocity"):
+                        lin = robot.get_relative_linear_velocity()
+                        ang = robot.get_relative_angular_velocity()
+                    else:
+                        lin = robot.get_linear_velocity()
+                        ang = robot.get_angular_velocity()
                     lin = lin.detach().cpu().numpy() if hasattr(lin, "cpu") else np.asarray(lin)
                     ang = ang.detach().cpu().numpy() if hasattr(ang, "cpu") else np.asarray(ang)
                     og_obs[robot_name_in_config]["robot_lin_vel"] = lin[:3]
@@ -1395,7 +1551,7 @@ def main() -> int:
                 q0 = np.asarray(current_q, dtype=np.float64).ravel()
                 if len(q0) >= robot_model.num_joints:
                     step0_no_op_action = {
-                        robot_name_in_config: _pinocchio_q_to_controller_order_action(robot, q0, robot_model).copy()
+                        robot_name_in_config: _robot_model_q_to_controller_order_action(robot, q0, robot_model).copy()
                     }
         # Capture initial standing pose once at step 0 for --hold_initial_pose.
         # Use simulator joint positions in OG order -> controller order (no Pinocchio) so the action
@@ -1415,7 +1571,7 @@ def main() -> int:
                 q0 = np.asarray(current_q, dtype=np.float64).ravel()
                 if len(q0) >= robot_model.num_joints:
                     initial_standing_pose = {
-                        robot_name_in_config: _pinocchio_q_to_controller_order_action(robot, q0, robot_model).copy()
+                        robot_name_in_config: _robot_model_q_to_controller_order_action(robot, q0, robot_model).copy()
                     }
                     if args.verbose:
                         print("hold_initial_pose: captured initial standing pose from step-0 observation (Pinocchio fallback).")
@@ -1607,12 +1763,14 @@ def main() -> int:
             q_pinocchio = np.asarray(gr00t_action["q"], dtype=np.float64).ravel()
             if q_pinocchio.size == getattr(robot, "n_dof", q_pinocchio.size):
                 # WBC output is in Pinocchio order: map by joint name to controller order
-                og_action[robot_name_in_config] = _pinocchio_q_to_controller_order_action(
+                og_action[robot_name_in_config] = _robot_model_q_to_controller_order_action(
                     robot, q_pinocchio, robot_model
                 )
         elif isinstance(og_action, dict) and env.robots and robot_name_in_config in og_action:
             robot = env.robots[0]
             q_vec = np.asarray(og_action[robot_name_in_config], dtype=np.float64).ravel()
+            # Adapter output is in og_joint_names order (same as robot.joint_names when set by run script).
+            # Only reorder when length matches full dof; then _joint_positions_to_controller_order_action expects q in robot dof order.
             if q_vec.size == getattr(robot, "n_dof", q_vec.size):
                 # Adapter output in dof order: reorder by controller
                 og_action[robot_name_in_config] = _to_robot_action_dim(

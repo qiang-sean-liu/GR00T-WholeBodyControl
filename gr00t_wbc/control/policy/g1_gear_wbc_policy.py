@@ -1,4 +1,5 @@
 import collections
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -13,11 +14,13 @@ from gr00t_wbc.control.utils.gear_wbc_utils import get_gravity_orientation, load
 class G1GearWbcPolicy(Policy):
     """Simple G1 robot policy using OpenGearWbc trained neural network."""
 
-    def __init__(self, robot_model, config: str, model_path: str):
+    def __init__(self, robot_model, config: str, model_path: str, model_base_dir: Optional[str] = None):
         """Initialize G1GearWbcPolicy.
 
         Args:
             config_path: Path to gear_wbc YAML configuration file
+            model_path: Comma-separated relative paths to ONNX files (e.g. "policy/A.onnx,policy/B.onnx").
+            model_base_dir: If set, paths are resolved under this directory; else under sim2mujoco/resources/robots/g1.
         """
         self.config, self.LEGGED_GYM_ROOT_DIR = load_config(config)
         self.robot_model = robot_model
@@ -25,13 +28,14 @@ class G1GearWbcPolicy(Policy):
 
         package_root = Path(__file__).resolve().parents[2]
         self.sim2mujoco_root_dir = str(package_root / "sim2mujoco")
+        base_dir = model_base_dir if model_base_dir else (self.sim2mujoco_root_dir + "/resources/robots/g1")
         model_path_1, model_path_2 = model_path.split(",")
 
         self.policy_1 = self.load_onnx_policy(
-            self.sim2mujoco_root_dir + "/resources/robots/g1/" + model_path_1
+            os.path.join(base_dir, model_path_1.strip())
         )
         self.policy_2 = self.load_onnx_policy(
-            self.sim2mujoco_root_dir + "/resources/robots/g1/" + model_path_2
+            os.path.join(base_dir, model_path_2.strip())
         )
 
         # Initialize observation history buffer

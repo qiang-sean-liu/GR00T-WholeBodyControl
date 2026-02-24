@@ -39,6 +39,7 @@ def override_wbc_config(
         "ENABLE_OFFSCREEN": config.enable_offscreen,
         "ENABLE_ONSCREEN": config.enable_onscreen,
         "model_path": config.wbc_model_path,
+        "model_base_dir": config.wbc_model_base_dir,
         "enable_waist": config.enable_waist,
         "with_hands": config.with_hands,
         "verbose": config.verbose,
@@ -81,6 +82,9 @@ class BaseConfig(ArgsConfigTemplate):
     )
     """Path to WBC model file (relative to gr00t_wbc/sim2mujoco/resources/robots/g1)"""
     """gear_wbc model path: policy/GR00T-WholeBodyControl-Balance.onnx,policy/GR00T-WholeBodyControl-Walk.onnx"""
+
+    wbc_model_base_dir: Optional[str] = None
+    """If set, ONNX paths are resolved under this dir instead of sim2mujoco/resources/robots/g1."""
 
     wbc_policy_class: str = "G1DecoupledWholeBodyPolicy"
     """Whole body policy class."""

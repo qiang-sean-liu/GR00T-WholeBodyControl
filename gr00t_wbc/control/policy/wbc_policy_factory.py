@@ -53,6 +53,7 @@ def get_wbc_policy(
                 robot_model=robot_model,
                 config=gear_wbc_config,
                 model_path=wbc_config["model_path"],
+                model_base_dir=wbc_config.get("model_base_dir"),
             )
 
         wbc_policy = G1DecoupledWholeBodyPolicy(
