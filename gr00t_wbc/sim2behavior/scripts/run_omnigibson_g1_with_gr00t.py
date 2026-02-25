@@ -379,6 +379,11 @@ def main() -> int:
         help="Dump D435 and topdown camera extrinsics for each frame to output_frames/camera_extrinsics_per_frame.json",
     )
     parser.add_argument(
+        "--dump_head_camera_pose",
+        action="store_true",
+        help="Dump head_link and head_camera world pose (and Arena offset) once at step 0 to output_frames/head_camera_pose_dump.json for comparison with Isaac Lab Arena.",
+    )
+    parser.add_argument(
         "--video_fps",
         type=int,
         default=30,
@@ -1356,6 +1361,119 @@ def main() -> int:
         if args.verbose and step_for_log == 0:
             print(f"[step 0] robot_pos(world)={robot_pos.tolist()}, external_camera_pos={camera_pos.tolist()}, look_at_robot")
 
+    # IsaacLab-Arena G1 head camera offset (head_link frame). Pose updated each step in _update_head_camera_follow_head_link.
+    # Arena: prim_path Robot/head_link/RobotHeadCam, offset position_xyz=(0.04485, 0, 0.35325), rotation_wxyz=(...).
+    # We use the same offset from robot.links["head"] or ["head_link"]. No extra offset until head_link origins and
+    # final camera poses are verified to match Arena (see docs/ISAACLAB_ARENA_G1_CAMERAS.md § Verifying head_link and camera pose).
+    ARENA_HEAD_CAM_OFFSET_POS = (0.04485, 0.0, 0.35325)
+    ARENA_HEAD_CAM_OFFSET_WXYZ = (0.32651, -0.62721, 0.62721, -0.32651)
+    ARENA_HEAD_CAM_OFFSET_XYZW = (ARENA_HEAD_CAM_OFFSET_WXYZ[1], ARENA_HEAD_CAM_OFFSET_WXYZ[2], ARENA_HEAD_CAM_OFFSET_WXYZ[3], ARENA_HEAD_CAM_OFFSET_WXYZ[0])
+
+    _head_camera_update_failed_once = [False]  # list so we can mutate from nested function
+    _head_camera_pose_dump = [None]  # set once at step 0 when --dump_head_camera_pose, for verification vs Arena
+
+    def _update_head_camera_follow_head_link(step_for_log=0):
+        """Place head_camera at head link + Arena offset (same extrinsics as isaaclab_arena G1 robot_head_cam)."""
+        external = env.external_sensors if env else None
+        if not external or "head_camera" not in external:
+            return
+        if not env.robots:
+            return
+        robot = env.robots[0]
+        # Use robot.links (like check_unitree_g1_orientation.py) - more reliable than ControllableObjectViewAPI
+        if not hasattr(robot, "links") or not isinstance(robot.links, dict):
+            if not _head_camera_update_failed_once[0]:
+                print("head_camera: robot has no links dict; camera pose will not follow robot.", file=sys.stderr)
+                _head_camera_update_failed_once[0] = True
+            return
+        head_link = None
+        head_link_name = None
+        # Arena mounts at head_link; same USD used in both, so prefer head_link to match.
+        for candidate in ("head_link", "head"):
+            if candidate in robot.links:
+                head_link = robot.links[candidate]
+                head_link_name = candidate
+                break
+        if head_link is None:
+            for name in robot.links.keys():
+                if "head" in name.lower():
+                    head_link = robot.links[name]
+                    head_link_name = name
+                    break
+        if head_link is None:
+            if not _head_camera_update_failed_once[0]:
+                print("head_camera: no head link in robot.links (tried 'head_link', 'head'). Camera will not follow.", file=sys.stderr)
+                _head_camera_update_failed_once[0] = True
+            return
+        try:
+            head_pos, head_quat = head_link.get_position_orientation(frame="world")
+        except Exception as e:
+            if not _head_camera_update_failed_once[0]:
+                print(f"head_camera: link.get_position_orientation failed: {e}", file=sys.stderr)
+                _head_camera_update_failed_once[0] = True
+            return
+        head_pos = np.asarray(head_pos).ravel()[:3]
+        head_quat = np.asarray(head_quat).ravel()
+        if len(head_quat) != 4:
+            return
+        # XFormPrim returns (x,y,z,w) per OmniGibson convention
+        hx, hy, hz, hw = head_quat[0], head_quat[1], head_quat[2], head_quat[3]
+        try:
+            from scipy.spatial.transform import Rotation as SciPyR
+            R_head = SciPyR.from_quat([hx, hy, hz, hw])
+            offset_pos = np.array(ARENA_HEAD_CAM_OFFSET_POS, dtype=np.float64)
+            cam_pos_world = head_pos + R_head.apply(offset_pos)
+            R_offset = SciPyR.from_quat(ARENA_HEAD_CAM_OFFSET_XYZW)
+            # Arena uses Isaac Lab (ROS) convention; OmniGibson VisionSensor uses USD/OpenGL.
+            # R_y180: flip view direction (+Z -> -Z) so camera faces forward instead of backward.
+            # R_z180: fix upside-down + left-right flipped image (up axis -Y vs +Y).
+            R_y180 = SciPyR.from_quat([0.0, 1.0, 0.0, 0.0])  # 180° around Y
+            R_z180 = SciPyR.from_quat([0.0, 0.0, 1.0, 0.0])  # 180° around Z
+            cam_quat_world = (R_head * R_offset * R_y180 * R_z180).as_quat()  # (x,y,z,w)
+        except ImportError:
+            cam_pos_world = head_pos + np.array(ARENA_HEAD_CAM_OFFSET_POS, dtype=np.float64)
+            step1 = _quat_mult_xyzw(
+                np.array([hx, hy, hz, hw], dtype=np.float32),
+                np.array(ARENA_HEAD_CAM_OFFSET_XYZW, dtype=np.float32),
+            )
+            step2 = _quat_mult_xyzw(
+                step1,
+                np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),  # 180° around Y
+            )
+            cam_quat_world = _quat_mult_xyzw(
+                step2,
+                np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32),  # 180° around Z
+            )
+        external["head_camera"].set_position_orientation(
+            position=cam_pos_world.astype(np.float32).tolist(),
+            orientation=cam_quat_world.astype(np.float32).tolist(),
+            frame="world",
+        )
+        if args.dump_head_camera_pose and step_for_log == 0 and _head_camera_pose_dump[0] is None:
+            # Camera pose in world before R_y180*R_z180 (for Arena comparison: same as head_link * offset in ROS)
+            try:
+                from scipy.spatial.transform import Rotation as SciPyR
+                R_head = SciPyR.from_quat([hx, hy, hz, hw])
+                R_offset = SciPyR.from_quat(ARENA_HEAD_CAM_OFFSET_XYZW)
+                cam_quat_arena_style = (R_head * R_offset).as_quat()  # (x,y,z,w)
+                cam_pos_arena_style = (head_pos + R_head.apply(np.array(ARENA_HEAD_CAM_OFFSET_POS, dtype=np.float64))).tolist()
+            except Exception:
+                cam_quat_arena_style = None
+                cam_pos_arena_style = None
+            _head_camera_pose_dump[0] = {
+                "coordinate_system": "world frame (OmniGibson/Isaac Sim: right-handed, Z-up); quaternions (x,y,z,w)",
+                "head_link_name": head_link_name,
+                "arena_offset_position_xyz": list(ARENA_HEAD_CAM_OFFSET_POS),
+                "arena_offset_rotation_wxyz": list(ARENA_HEAD_CAM_OFFSET_WXYZ),
+                "arena_offset_frame_note": "offset is in head_link frame (ROS convention); all other poses in world",
+                "head_link_position_world": head_pos.tolist(),
+                "head_link_orientation_xyzw": [float(hx), float(hy), float(hz), float(hw)],
+                "camera_position_world_set": cam_pos_world.astype(np.float32).tolist(),
+                "camera_orientation_xyzw_set": cam_quat_world.astype(np.float32).tolist(),
+                "camera_position_world_arena_style": cam_pos_arena_style,
+                "camera_orientation_xyzw_arena_style": cam_quat_arena_style.tolist() if cam_quat_arena_style is not None else None,
+            }
+
     # Main loop
     if args.topdown_follow_robot:
         print("Topdown camera will follow robot (height 1m, offset 1m in x/y, oriented at robot center)")
@@ -1412,6 +1530,9 @@ def main() -> int:
     og_obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
     current_q = None  # Track current joint state for action adapter
 
+    # Update head camera once after reset so the first step's observation uses the correct pose
+    _update_head_camera_follow_head_link(step_for_log=-1)
+
     # initial_standing_pose for --hold_initial_pose is captured from the sim at step 0 only (see loop below).
     # We do NOT use robot_model.default_body_pose here: it does not match OmniGibson's G1 (causes floating, legs backwards, flying).
     initial_standing_pose = None
@@ -1451,6 +1572,20 @@ def main() -> int:
 
         # Update topdown camera to follow robot (before step so next obs uses updated pose)
         _update_topdown_follow_robot(step_for_log=step)
+        # Update head camera to head_link + Arena offset (Arena-aligned extrinsics)
+        _update_head_camera_follow_head_link(step_for_log=step)
+
+        if args.dump_head_camera_pose and step == 0 and _head_camera_pose_dump[0] is not None:
+            out_dir = frames_dir or os.path.join(SIM2BEHAVIOR_ROOT, "output_frames")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, "head_camera_pose_dump.json")
+            try:
+                with open(out_path, "w") as f:
+                    json.dump(_head_camera_pose_dump[0], f, indent=2)
+                print(f"Dumped head_link and head_camera pose to {out_path} (for comparison with Arena)")
+            except Exception as e:
+                print(f"Failed to write {out_path}: {e}", file=sys.stderr)
+            _head_camera_pose_dump[0] = None  # only dump once
 
         # Dump camera extrinsics for this frame (before step, so we capture pose before action)
         if args.dump_camera_extrinsics_per_frame:

@@ -12,7 +12,7 @@
 #   - scene_model "Rs_int" is a simple room; other options depend on your OmniGibson/BEHAVIOR install.
 #     See: https://behavior.stanford.edu/omnigibson/scenes.html
 #
-# Same camera/robot settings as g1_standalone.yaml; only the scene section differs.
+# Same camera/robot settings as g1_standalone.yaml (cameras match isaaclab_arena_g1; see docs/CAMERAS_SIM2BEHAVIOR_VS_ISAACLAB_ARENA_G1.md); only the scene section differs.
 
 env:
   action_frequency: 50      # Match Mujoco: control_decimation=4 at 200Hz → 50Hz control
@@ -24,8 +24,8 @@ env:
       relative_prim_path: /topdown_camera
       modalities: [rgb]
       sensor_kwargs:
-        image_height: 480
-        image_width: 640
+        image_height: 480   # RS_VIEW_CAMERA_HEIGHT (isaaclab_arena_g1 parity)
+        image_width: 640   # RS_VIEW_CAMERA_WIDTH (isaaclab_arena_g1 parity)
         focal_length: 12.0
         # ~120° horizontal FOV: FOV = 2*atan(horizontal_aperture/(2*focal_length)) => horizontal_aperture ≈ 3.464*focal_length
         horizontal_aperture: 41.57
@@ -36,8 +36,23 @@ env:
       orientation: [0.0, 0.0, 0.0, 1.0]  # identity (look -Z). If you see sky, try --topdown_orientation flip_x
       pose_frame: scene
       include_in_obs: true
+    # Head camera: Arena-aligned (head_link frame, same intrinsics/extrinsics as isaaclab_arena G1CameraCfg).
+    # Use same units as Arena/USD (cm) so FOV matches; see g1_standalone.yaml comment.
+    - sensor_type: VisionSensor
+      name: head_camera
+      relative_prim_path: /head_camera
+      modalities: [rgb]
+      sensor_kwargs:
+        image_height: 480
+        image_width: 640
+        focal_length: 0.169   # cm (Arena PinholeCameraCfg)
+        horizontal_aperture: 0.693
+      position: [0.0, 0.0, 1.2]
+      orientation: [0.0, 0.0, 0.0, 1.0]
+      pose_frame: scene
+      include_in_obs: true
 
-# Scene with geometry: floor, walls, and furniture (better contrast with robot than empty Scene).
+# Scene with geometry: floor, walls, and furniture floor, walls, and furniture (better contrast with robot than empty Scene).
 # Do NOT set load_object_categories here; leaving it unset loads all categories from the scene
 # JSON (floors, walls, furniture, etc.). If you set e.g. load_object_categories: ["floors", "walls"],
 # the saved scene USD (OMNIGIBSON_SAVE_SCENE_USD_TO) will only contain structure and look almost empty.
@@ -119,6 +134,6 @@ robots:
     sensor_config:
       VisionSensor:
         sensor_kwargs:
-          image_height: 480   # Match MuJoCo RS_VIEW_CAMERA_HEIGHT
-          image_width: 640    # Match MuJoCo RS_VIEW_CAMERA_WIDTH
+          image_height: 480   # RS_VIEW_CAMERA_HEIGHT (isaaclab_arena_g1 parity)
+          image_width: 640    # RS_VIEW_CAMERA_WIDTH (isaaclab_arena_g1 parity)
           focal_length: 5.41  # Match MuJoCo robot0_oak_egoview fovy 79.5° (vertical FOV)

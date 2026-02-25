@@ -52,25 +52,33 @@ class OmniGibsonToGR00TObservationAdapter:
         self.state_time_horizon = state_time_horizon
 
         # Default camera mapping: OmniGibson camera keys → RoboCasa camera keys
-        # These will be further mapped via CameraKeyMapper to policy keys (ego_view, tpp_view)
+        # head_camera (Arena-aligned, head_link) is preferred for ego_view when present; else d435.
         if camera_mapping is None:
             self.camera_mapping = {
-                "unitree_g1:d435_link:Camera:0": "robot0_oak_egoview",  # Maps to ego_view via CameraKeyMapper
-                "unitree_g1:mid360_link:Camera:0": "robot0_rs_tppview",  # Maps to tpp_view via CameraKeyMapper
+                "unitree_g1:d435_link:Camera:0": "robot0_oak_egoview",
+                "unitree_g1:mid360_link:Camera:0": "robot0_rs_tppview",
             }
+            # Order of sources for ego_view: head_camera (Arena) first, then d435
+            self._ego_camera_priority = ["head_camera", "unitree_g1:d435_link:Camera:0"]
         else:
             self.camera_mapping = camera_mapping
+            self._ego_camera_priority = ["head_camera", "unitree_g1:d435_link:Camera:0"]
 
         # Reverse mapping for lookup
         self.reverse_camera_mapping = {v: k for k, v in self.camera_mapping.items()}
         
-        # Import CameraKeyMapper to get mapped keys (ego_view, tpp_view, etc.)
+        # Import CameraKeyMapper and RS_VIEW constants (same as isaaclab_arena_g1 / GR00T evaluation)
         try:
             from gr00t_wbc.control.envs.robocasa.utils.cam_key_converter import CameraKeyMapper
+            from gr00t_wbc.data.constants import RS_VIEW_CAMERA_HEIGHT, RS_VIEW_CAMERA_WIDTH
             self.camera_key_mapper = CameraKeyMapper()
+            self._camera_height = RS_VIEW_CAMERA_HEIGHT
+            self._camera_width = RS_VIEW_CAMERA_WIDTH
         except ImportError:
-            # Fallback: use direct mapping if CameraKeyMapper not available
+            # Fallback: use direct mapping if CameraKeyMapper not available; use 480x640 to match constants
             self.camera_key_mapper = None
+            self._camera_height = 480
+            self._camera_width = 640
 
     def adapt(self, og_obs: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
         """
@@ -410,14 +418,20 @@ class OmniGibsonToGR00TObservationAdapter:
                 camera_rgb[key] = np.asarray(value["rgb"])
 
         # Map OmniGibson camera keys to GR00T camera keys
-        # First map to RoboCasa camera names, then use CameraKeyMapper to get policy keys
-        for og_cam_key_pattern, robocasa_cam_key in self.camera_mapping.items():
+        # For ego_view use _ego_camera_priority (head_camera first, then d435); fill each robocasa key only once.
+        already_set_robocasa = set()
+        sources = []
+        for og_key in getattr(self, "_ego_camera_priority", ["head_camera", "unitree_g1:d435_link:Camera:0"]):
+            sources.append((og_key, "robot0_oak_egoview"))
+        sources.append(("unitree_g1:mid360_link:Camera:0", "robot0_rs_tppview"))
+
+        for og_cam_key_pattern, robocasa_cam_key in sources:
+            if robocasa_cam_key in already_set_robocasa:
+                continue
             rgb = None
-            # Try exact match
             if og_cam_key_pattern in camera_rgb:
                 rgb = camera_rgb[og_cam_key_pattern]
             else:
-                # Try substring match (e.g., "d435_link" matches "unitree_g1:d435_link:Camera:0")
                 pattern_parts = og_cam_key_pattern.split(":")
                 for cam_key in camera_rgb.keys():
                     if all(part in cam_key for part in pattern_parts if part):
@@ -428,8 +442,8 @@ class OmniGibsonToGR00TObservationAdapter:
                 # Ensure uint8 and correct shape
                 if rgb.ndim == 3 and rgb.shape[-1] >= 3:
                     rgb_uint8 = rgb[:, :, :3].astype(np.uint8)
-                    # Resize to match expected resolution (640x480 from RS_VIEW constants)
-                    target_h, target_w = 480, 640
+                    # Resize to match isaaclab_arena_g1 / GR00T evaluation (RS_VIEW_CAMERA_*)
+                    target_h, target_w = self._camera_height, self._camera_width
                     if rgb_uint8.shape[:2] != (target_h, target_w):
                         rgb_uint8 = cv2.resize(rgb_uint8, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
@@ -458,6 +472,7 @@ class OmniGibsonToGR00TObservationAdapter:
                         obs[f"{robocasa_cam_key}_image"] = rgb_uint8
                         video_frames = np.tile(rgb_uint8[np.newaxis, np.newaxis, ...], (1, self.video_time_horizon, 1, 1, 1))  # (1, T, H, W, C)
                         obs[f"video.{robocasa_cam_key}"] = video_frames
+                    already_set_robocasa.add(robocasa_cam_key)
                 else:
                     # Invalid shape, use zeros
                     if self.camera_key_mapper is not None:
@@ -465,8 +480,8 @@ class OmniGibsonToGR00TObservationAdapter:
                         mapped_key = mapped_key_result[0] if mapped_key_result else robocasa_cam_key
                     else:
                         mapped_key = robocasa_cam_key
-                    obs[f"{mapped_key}_image"] = np.zeros((480, 640, 3), dtype=np.uint8)
-                    obs[f"video.{mapped_key}"] = np.zeros((1, self.video_time_horizon, 480, 640, 3), dtype=np.uint8)  # (B=1, T, H, W, C)
+                    obs[f"{mapped_key}_image"] = np.zeros((self._camera_height, self._camera_width, 3), dtype=np.uint8)
+                    obs[f"video.{mapped_key}"] = np.zeros((1, self.video_time_horizon, self._camera_height, self._camera_width, 3), dtype=np.uint8)  # (B=1, T, H, W, C)
             else:
                 # Camera not found, use zeros
                 if self.camera_key_mapper is not None:
@@ -474,8 +489,8 @@ class OmniGibsonToGR00TObservationAdapter:
                     mapped_key = mapped_key_result[0] if mapped_key_result else robocasa_cam_key
                 else:
                     mapped_key = robocasa_cam_key
-                obs[f"{mapped_key}_image"] = np.zeros((480, 640, 3), dtype=np.uint8)
-                obs[f"video.{mapped_key}"] = np.zeros((1, self.video_time_horizon, 480, 640, 3), dtype=np.uint8)  # (B=1, T, H, W, C)
+                obs[f"{mapped_key}_image"] = np.zeros((self._camera_height, self._camera_width, 3), dtype=np.uint8)
+                obs[f"video.{mapped_key}"] = np.zeros((1, self.video_time_horizon, self._camera_height, self._camera_width, 3), dtype=np.uint8)  # (B=1, T, H, W, C)
 
 
 class GR00TToOmniGibsonActionAdapter:

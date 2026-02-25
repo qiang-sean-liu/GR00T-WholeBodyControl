@@ -1,9 +1,9 @@
 # Minimal OmniGibson standalone config for Unitree G1 (sim2behavior).
 # Loads G1 URDF in a simple empty scene for testing robot loading and basic control.
 #
-# Camera parameters match GR00T G1 evaluation (gr00t_wbc/data/constants.py and SyncEnv):
-#   RS_VIEW_CAMERA_WIDTH=640, RS_VIEW_CAMERA_HEIGHT=480. RoboCasa uses fovy=60° for agentview;
-#   focal_length tuned to give a similar FOV (wider than default 17 mm).
+# Camera parameters match isaaclab_arena_g1 / GR00T evaluation (gr00t_wbc/data/constants.py):
+#   RS_VIEW_CAMERA_WIDTH=640, RS_VIEW_CAMERA_HEIGHT=480. See docs/CAMERAS_SIM2BEHAVIOR_VS_ISAACLAB_ARENA_G1.md.
+#   focal_length tuned for similar FOV (robot: 5.41; topdown: 12.0).
 
 env:
   action_frequency: 50      # Match Mujoco: control_decimation=4 at 200Hz -> 50Hz control
@@ -16,12 +16,29 @@ env:
       relative_prim_path: /topdown_camera
       modalities: [rgb]
       sensor_kwargs:
-        image_height: 480   # Match G1 eval: RS_VIEW_CAMERA_HEIGHT
-        image_width: 640    # Match G1 eval: RS_VIEW_CAMERA_WIDTH
+        image_height: 480   # RS_VIEW_CAMERA_HEIGHT (isaaclab_arena_g1 parity)
+        image_width: 640    # RS_VIEW_CAMERA_WIDTH (isaaclab_arena_g1 parity)
         # Wider FOV so the robot fits in frame (~60° like RoboCasa agentview).
         focal_length: 12.0
       position: [0.0, 0.0, 3.5]   # above robot (robot at z~0.8); raise to 3.5 if needed to see full body
       # identity = look along -Z. If view shows sky, use script flag: --topdown_orientation flip_x
+      orientation: [0.0, 0.0, 0.0, 1.0]
+      pose_frame: scene
+      include_in_obs: true
+    # Head camera: Arena-aligned (head_link frame, same intrinsics/extrinsics as isaaclab_arena G1CameraCfg).
+    # Pose is updated each step by the run script from robot head_link + Arena offset.
+    # Use same units as Arena/USD (cm) so FOV matches; OmniGibson/Isaac Sim may interpret as cm (tenth of world unit).
+    - sensor_type: VisionSensor
+      name: head_camera
+      relative_prim_path: /head_camera
+      modalities: [rgb]
+      sensor_kwargs:
+        image_height: 480
+        image_width: 640
+        focal_length: 0.169   # cm (Arena PinholeCameraCfg), ~80° vert FOV
+        horizontal_aperture: 0.693  # cm, ~128° horiz FOV
+        vertical_aperture: 0.284   # cm, ~80° vert FOV
+      position: [0.0, 0.0, 1.2]   # placeholder; set each step from head_link + Arena offset
       orientation: [0.0, 0.0, 0.0, 1.0]
       pose_frame: scene
       include_in_obs: true
@@ -101,9 +118,9 @@ robots:
     sensor_config:
       VisionSensor:
         sensor_kwargs:
-          image_height: 480   # Match MuJoCo RS_VIEW_CAMERA_HEIGHT
-          image_width: 640    # Match MuJoCo RS_VIEW_CAMERA_WIDTH
-          focal_length: 5.41  # Match MuJoCo robot0_oak_egoview fovy 79.5 deg (vertical FOV)
+          image_height: 480   # RS_VIEW_CAMERA_HEIGHT (isaaclab_arena_g1 parity)
+          image_width: 640    # RS_VIEW_CAMERA_WIDTH (isaaclab_arena_g1 parity)
+          focal_length: 5.41  # Match MuJoCo robot0_oak_egoview fovy 79.5° (vertical FOV)
 
 # Optional: minimal task config (not needed for standalone robot testing)
 # task:
