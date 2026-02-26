@@ -52,10 +52,10 @@ env:
       pose_frame: scene
       include_in_obs: true
 
-# Scene with geometry: floor, walls, and furniture floor, walls, and furniture (better contrast with robot than empty Scene).
-# Do NOT set load_object_categories here; leaving it unset loads all categories from the scene
-# JSON (floors, walls, furniture, etc.). If you set e.g. load_object_categories: ["floors", "walls"],
-# the saved scene USD (OMNIGIBSON_SAVE_SCENE_USD_TO) will only contain structure and look almost empty.
+# Scene with geometry: floor, walls, and furniture (better contrast with robot than empty Scene).
+# Rs_int is a simple room; with load_object_categories unset, the scene JSON loads all categories
+# (floors, walls, furniture, etc.), so there can be tables and other furniture in view.
+# Do NOT set load_object_categories to ["floors", "walls"] only, or the scene will have no furniture.
 scene:
   type: "InteractiveTraversableScene"
   scene_model: "Rs_int"   # Simple room; must exist in BEHAVIOR/OmniGibson scene data.
@@ -66,6 +66,18 @@ scene:
   # trav_map_with_objects: true
   # num_waypoints: 10
   # waypoint_resolution: 0.2
+
+# Box on table in view: Rs_int (Rs_int_best) has robot at (0,0,0.85); breakfast_table_skczfi_0 is
+# at (1.47, 0.41, 0.60) root_link — the table in front of the robot. Surface ~0.75 m; box center
+# z = table_surface + half_cube (0.83 for 16 cm cube).
+objects:
+  - type: "PrimitiveObject"
+    name: "box_on_table"
+    primitive_type: "Cube"
+    position: [1.47, 0.41, 0.83]   # on breakfast_table_skczfi_0 (table in robot view)
+    scale: [0.16, 0.16, 0.16]     # 16 cm cube (twice 8 cm)
+    orientation: [0.0, 0.0, 0.0, 1.0]
+    rgba: [0.55, 0.35, 0.15, 1.0] # brown (R, G, B, A in 0–1)
 
 robots:
   # UnitreeG1 loads g1_29dof_with_hand_rev_1_0.usd when available (Isaac Lab parity).

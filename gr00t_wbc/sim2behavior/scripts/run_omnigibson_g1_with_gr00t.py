@@ -161,6 +161,29 @@ G1_JOINT_LIMITS = {
 # Set OMNIGIBSON_DATA_PATH or use --behavior_data_path to override.
 _DEFAULT_BEHAVIOR_DATA_PATH = "/mnt/nas26/qiang.liu/BEHAVIOR-1K/datasets"
 
+# Robot camera presets (VisionSensor.sensor_kwargs). Applied to (1) robot onboard VisionSensors and
+# (2) the external head_camera when present (head_camera is the GR00T ego feed in sim2behavior).
+# See docs/CAMERAS_SIM2BEHAVIOR_VS_SIM2MUJOJO.md and docs/USD_CAMERAS_AND_CONFIG.md.
+#
+# focal_length / aperture units: OmniGibson VisionSensor docstring says focal_length and
+# horizontal_aperture are in mm. In practice, (1) "mujoco" uses mm (5.41 mm → ~79.5° vert FOV);
+# (2) "arena_g1" uses the same numeric values as Isaac Lab Arena, which are in cm (0.169 cm etc.);
+# use those values as-is for correct FOV (see USD_CAMERAS_AND_CONFIG.md).
+ROBOT_CAMERA_PRESETS = {
+    "mujoco": {
+        "image_height": 480,
+        "image_width": 640,
+        "focal_length": 0.541,  # mm; ~79.5° vertical FOV (MuJoCo robot0_oak_egoview)
+    },
+    "arena_g1": {
+        "image_height": 480,
+        "image_width": 640,
+        "focal_length": 0.169,       # cm (Isaac Lab Arena PinholeCameraCfg); use as-is
+        "horizontal_aperture": 0.693,
+        # "vertical_aperture": 0.284,  # cm; ~80° vert, ~128° horiz (Arena robot_head_cam)
+    },
+}
+
 # Add Isaac-GR00T repo root to Python path (for gr00t imports)
 # Script is at: Isaac-GR00T/external_dependencies/GR00T-WholeBodyControl/gr00t_wbc/sim2behavior/scripts/...
 # Repo root is: Isaac-GR00T/ (5 levels up from script)
@@ -365,13 +388,13 @@ def main() -> int:
     parser.add_argument(
         "--max_steps",
         type=int,
-        default=100,
-        help="Maximum simulation steps",
+        default=500,
+        help="Maximum simulation steps (at 50 Hz action_frequency, 500 steps = 10 s)",
     )
     parser.add_argument(
         "--save_video",
         action="store_true",
-        help="Save video frames to output_frames/",
+        help="Save video frames to output_frames/. Includes ego_view_gr00t.mp4 (policy's primary camera input; from robot preset camera when D435 is in obs, else head_camera).",
     )
     parser.add_argument(
         "--dump_camera_extrinsics_per_frame",
@@ -394,6 +417,13 @@ def main() -> int:
         type=str,
         default=CONFIG_PATH,
         help="Path to OmniGibson config YAML",
+    )
+    parser.add_argument(
+        "--robot_camera_preset",
+        type=str,
+        default="mujoco",
+        choices=list(ROBOT_CAMERA_PRESETS.keys()),
+        help="Camera preset for robot onboard cameras and head_camera (GR00T ego feed): 'mujoco' (fovy~79.5°, 640x480) or 'arena_g1' (Isaac Lab Arena G1 head cam). Does not affect other external cameras (e.g. topdown).",
     )
     parser.add_argument(
         "--scene_model",
@@ -632,6 +662,26 @@ def main() -> int:
         env_config["scene"] = dict(env_config["scene"])
         env_config["scene"]["scene_model"] = args.scene_model
         print(f"Using scene_model: {args.scene_model}")
+
+    # Apply robot camera preset to (1) robot onboard VisionSensors and (2) head_camera when present.
+    # head_camera is the feed to GR00T when defined in the config; preset sets its intrinsics/resolution.
+    preset = ROBOT_CAMERA_PRESETS[args.robot_camera_preset]
+    robots_cfg = env_config.get("robots") or []
+    if robots_cfg:
+        robot0 = robots_cfg[0] if isinstance(robots_cfg[0], dict) else None
+        if robot0 is not None:
+            sensor_cfg = robot0.setdefault("sensor_config", {})
+            vs_cfg = sensor_cfg.setdefault("VisionSensor", {})
+            sk = vs_cfg.setdefault("sensor_kwargs", {})
+            sk.update(preset)
+    # Also apply preset to head_camera (external sensor used as GR00T ego feed when present)
+    env_cfg = env_config.get("env") or {}
+    external_sensors = env_cfg.get("external_sensors") or []
+    for ext in external_sensors:
+        if isinstance(ext, dict) and ext.get("name") == "head_camera":
+            ext.setdefault("sensor_kwargs", {}).update(preset)
+            break
+    print(f"Robot camera preset: {args.robot_camera_preset} (image_height={preset.get('image_height')}, image_width={preset.get('image_width')}, focal_length={preset.get('focal_length')})")
 
     # Print loaded config diagnostics
     _env_cfg = env_config.get("env", {})
@@ -2153,6 +2203,18 @@ def main() -> int:
                 if cam_name not in camera_frames:
                     camera_frames[cam_name] = []
                 camera_frames[cam_name].append(rgb)
+            # Always dump the policy's ego view (adapter output). When the robot has no D435 in obs,
+            # this comes from head_camera; when D435 is present it comes from the preset robot camera.
+            _ego_vid = gr00t_obs.get("video.ego_view")
+            if _ego_vid is None:
+                _ego_vid = gr00t_obs.get("video.robot0_oak_egoview")
+            if _ego_vid is not None:
+                _ego = np.asarray(_ego_vid)
+                if _ego.size > 0 and _ego.ndim >= 4 and _ego.shape[-1] in (3, 4) and _ego.shape[1] > 0:
+                    _frame = _ego[0, -1][:, :, :3].astype(np.uint8)
+                    if "ego_view" not in camera_frames:
+                        camera_frames["ego_view"] = []
+                    camera_frames["ego_view"].append(_frame)
 
         if done:
             print(f"Episode done at step {step}")
