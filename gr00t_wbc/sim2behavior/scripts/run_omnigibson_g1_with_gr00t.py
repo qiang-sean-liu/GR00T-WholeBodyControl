@@ -173,13 +173,13 @@ ROBOT_CAMERA_PRESETS = {
     "mujoco": {
         "image_height": 480,
         "image_width": 640,
-        "focal_length": 0.541,  # mm; ~79.5° vertical FOV (MuJoCo robot0_oak_egoview)
+        "focal_length": 0.275,  # default 0.541 cm; ~79.5° vertical FOV (MuJoCo robot0_oak_egoview)
     },
     "arena_g1": {
         "image_height": 480,
         "image_width": 640,
         "focal_length": 0.169,       # cm (Isaac Lab Arena PinholeCameraCfg); use as-is
-        "horizontal_aperture": 0.693,
+        "horizontal_aperture": 1.4,  # default 0.693 cm,
         # "vertical_aperture": 0.284,  # cm; ~80° vert, ~128° horiz (Arena robot_head_cam)
     },
 }
@@ -426,6 +426,13 @@ def main() -> int:
         help="Camera preset for robot onboard cameras and head_camera (GR00T ego feed): 'mujoco' (fovy~79.5°, 640x480) or 'arena_g1' (Isaac Lab Arena G1 head cam). Does not affect other external cameras (e.g. topdown).",
     )
     parser.add_argument(
+        "--g1_usd_variant",
+        type=str,
+        default="g1_29dof_with_hand_rev_1_0",
+        choices=["g1_29dof_with_hand_rev_1_0", "unitree_g1_usda"],
+        help="G1 robot USD to load: 'g1_29dof_with_hand_rev_1_0' (Isaac Lab parity, no D435 Camera in USD) or 'unitree_g1_usda' (has d435/mid360 Camera prims). Both under omnigibson-robot-assets/models/unitree_g1/usd.",
+    )
+    parser.add_argument(
         "--scene_model",
         type=str,
         default="",
@@ -663,6 +670,19 @@ def main() -> int:
         env_config["scene"]["scene_model"] = args.scene_model
         print(f"Using scene_model: {args.scene_model}")
 
+    # Override G1 robot USD when --g1_usd_variant is set (UnitreeG1 reads load_config["usd_path"]).
+    _g1_usd_dir = os.path.join(behavior_data_path, "omnigibson-robot-assets", "models", "unitree_g1", "usd")
+    if args.g1_usd_variant == "g1_29dof_with_hand_rev_1_0":
+        _g1_usd_file = "g1_29dof_with_hand_rev_1_0.usd"
+    else:
+        _g1_usd_file = "unitree_g1.usda"
+    _g1_usd_path = os.path.join(_g1_usd_dir, _g1_usd_file)
+    robots_list = env_config.get("robots") or []
+    if robots_list and isinstance(robots_list[0], dict):
+        robots_list[0].setdefault("load_config", {})["usd_path"] = _g1_usd_path
+        if args.verbose:
+            print(f"G1 USD variant: {args.g1_usd_variant} -> {_g1_usd_path}")
+
     # Apply robot camera preset to (1) robot onboard VisionSensors and (2) head_camera when present.
     # head_camera is the feed to GR00T when defined in the config; preset sets its intrinsics/resolution.
     preset = ROBOT_CAMERA_PRESETS[args.robot_camera_preset]
@@ -899,11 +919,23 @@ def main() -> int:
         return q_wbc
 
     def _pinocchio_name_to_index(robot_model, og_name: str):
-        """Resolve OmniGibson joint name to Pinocchio q index (exact or fuzzy match)."""
+        """Resolve OmniGibson joint name to Pinocchio q index (exact or fuzzy match).
+        Handles unitree_g1.usda vs g1_29dof naming (e.g. with/without '_joint' suffix)."""
         try:
             return robot_model.dof_index(og_name)
         except (ValueError, KeyError):
             pass
+        # Try with/without _joint suffix (unitree_g1.usda may use different convention)
+        if og_name.endswith("_joint"):
+            try:
+                return robot_model.dof_index(og_name[:-6])
+            except (ValueError, KeyError):
+                pass
+        else:
+            try:
+                return robot_model.dof_index(og_name + "_joint")
+            except (ValueError, KeyError):
+                pass
         # Fuzzy: normalize and find best match in robot_model joint names
         og_norm = og_name.lower().replace("_", "").replace("-", "").replace(" ", "")
         for pname in robot_model.joint_names:
@@ -1075,13 +1107,20 @@ def main() -> int:
                 f"WBC–OmniGibson mapping: {len(unmapped)} joint(s) have no Pinocchio match (will get 0.0): {[n for _, n in unmapped]}",
                 file=sys.stderr,
             )
-        if verbose and mapping_ok:
+            # Leg/waist unmapped -> robot receives 0.0 for those joints and can collapse (common with unitree_g1.usda if names differ).
+            base_like = [n for _, n in unmapped if "hip" in n or "knee" in n or "ankle" in n or "waist" in n]
+            if base_like:
+                print(
+                    "WBC–OmniGibson mapping: base/leg/waist joints unmapped (robot may collapse). Check USD joint names vs loco_manip_g1_joints_order_43dof.yaml.",
+                    file=sys.stderr,
+                )
+        if mapping_ok:
             print("WBC–OmniGibson mapping (controller_order -> Pinocchio index):")
             for i, og_name, pidx in mapping_ok[:20]:
                 print(f"  [{i}] {og_name} -> q[{pidx}]")
             if len(mapping_ok) > 20:
                 print(f"  ... and {len(mapping_ok) - 20} more.")
-        if not unmapped and verbose:
+        if not unmapped:
             print("WBC–OmniGibson mapping: all controller-order joints map to Pinocchio indices.")
 
     def _clip_action_to_g1_limits(robot, action_arr: np.ndarray, joint_names_in_order: list) -> np.ndarray:
@@ -1984,11 +2023,13 @@ def main() -> int:
             og_action[robot_name_in_config] = arr
 
         # Optional: zero the 15 base (lower-body) joints (for use with base use_delta_commands: true to hold pose).
-        # When zero_base_action is not set, the first 15 values come from WBC lower-body (real ONNX/WBC actions).
-        if args.zero_base_action and isinstance(og_action, dict) and robot_name_in_config in og_action:
+        # When zero_base_action is set, zero the base block only (15 for g1_29dof, 16 for unitree_g1.usda with waist_support_joint).
+        if args.zero_base_action and isinstance(og_action, dict) and robot_name_in_config in og_action and env.robots:
             arr = np.asarray(og_action[robot_name_in_config], dtype=np.float64).copy()
-            if len(arr) >= 15:
-                arr[0:15] = 0.0
+            base_ctrl = getattr(env.robots[0], "_controllers", {}).get("base")
+            n_base = len(base_ctrl.dof_idx) if base_ctrl is not None and hasattr(base_ctrl, "dof_idx") else 15
+            if n_base > 0 and len(arr) >= n_base:
+                arr[0:n_base] = 0.0
                 og_action[robot_name_in_config] = arr
 
         # Clip action to G1 joint limits (g1_constants) so OmniGibson receives same bounds as Isaac Lab / Mujoco
