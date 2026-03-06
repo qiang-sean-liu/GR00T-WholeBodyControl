@@ -78,6 +78,14 @@ objects:
     scale: [0.16, 0.16, 0.16]     # 16 cm cube (twice 8 cm)
     orientation: [0.0, 0.0, 0.0, 1.0]
     rgba: [0.55, 0.35, 0.15, 1.0] # brown (R, G, B, A in 0–1)
+  # Apple from BEHAVIOR-1K assets (behavior-1k-assets/objects/apple); same table, different spot
+  - type: "DatasetObject"
+    name: "apple_on_table"
+    category: "apple"
+    model: "bwteqh"
+    position: [1.20, 0.41, 0.83]
+    orientation: [0.0, 0.0, 0.0, 1.0]
+    dataset_name: "behavior-1k-assets"
 
 robots:
   # UnitreeG1 loads g1_29dof_with_hand_rev_1_0.usd when available (Isaac Lab parity).
